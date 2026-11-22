@@ -344,4 +344,55 @@ mod windows_impl {
             CoUninitialize();
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use windows::Win32::System::Threading::GetCurrentProcessId;
+
+        #[test]
+        fn wasapi_process_loopback_initializes_on_windows() {
+            unsafe {
+                let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
+                assert!(hr.is_ok(), "CoInitializeEx failed: {hr:?}");
+
+                let pid = GetCurrentProcessId();
+                let client = activate_process_loopback_client(pid)
+                    .expect("activate_process_loopback_client should succeed");
+
+                let format = WAVEFORMATEX {
+                    wFormatTag: WAVE_FORMAT_IEEE_FLOAT,
+                    nChannels: CHANNELS,
+                    nSamplesPerSec: SAMPLE_RATE,
+                    nAvgBytesPerSec: SAMPLE_RATE * (BLOCK_ALIGN as u32),
+                    nBlockAlign: BLOCK_ALIGN,
+                    wBitsPerSample: BITS_PER_SAMPLE,
+                    cbSize: 0,
+                };
+
+                let stream_flags = AUDCLNT_STREAMFLAGS_LOOPBACK
+                    | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+                    | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+                    | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+
+                let init_res = client.Initialize(
+                    AUDCLNT_SHAREMODE_SHARED,
+                    stream_flags,
+                    BUFFER_DURATION_100NS,
+                    0,
+                    &format,
+                    None,
+                );
+                assert!(init_res.is_ok(), "IAudioClient::Initialize failed: {init_res:?}");
+
+                let ev = CreateEventW(None, false, false, None).unwrap();
+                client.SetEventHandle(ev).expect("SetEventHandle failed");
+                let _cap: IAudioCaptureClient = client.GetService().expect("GetService failed");
+                client.Start().expect("Start failed");
+                client.Stop().expect("Stop failed");
+                let _ = CloseHandle(ev);
+                CoUninitialize();
+            }
+        }
+    }
 }

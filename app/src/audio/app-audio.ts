@@ -4,6 +4,14 @@ export interface AudioAppInfo {
   pid: number;
   processName: string;
   windowTitle: string;
+  hasAudioSession: boolean;
+  isPlayingAudio: boolean;
+}
+
+export interface AudioBridgeStatus {
+  state: "off" | "suspended" | "waiting" | "capturing";
+  label: string;
+  chunksReceived: number;
 }
 
 export function isTauriRuntime(): boolean {
@@ -45,13 +53,18 @@ export class AppAudioBridge {
   private ctx: AudioContext | null = null;
   private worklet: AudioWorkletNode | null = null;
   private analyser: AnalyserNode | null = null;
+  private monitorGain: GainNode | null = null;
   private destination: MediaStreamAudioDestinationNode | null = null;
   private meterBuffer: Float32Array<ArrayBuffer> | null = null;
   private activePid: number | null = null;
   private muted = false;
+  private monitoringLocally = false;
+  private chunksReceived = 0;
+  private lastChunkAt = 0;
 
   async init(): Promise<MediaStreamTrack> {
     if (this.destination) {
+      await this.ensureRunning();
       return this.destination.stream.getAudioTracks()[0];
     }
 
@@ -59,6 +72,12 @@ export class AppAudioBridge {
       sampleRate: 48000,
       latencyHint: "interactive",
     });
+
+    // Resume immediately while still inside the user's click gesture
+    if (ctx.state === "suspended") {
+      void ctx.resume().catch(() => {});
+    }
+
     await ctx.audioWorklet.addModule("/pcm-worklet.js");
 
     const worklet = new AudioWorkletNode(ctx, "pcm-ring-buffer", {
@@ -72,20 +91,36 @@ export class AppAudioBridge {
     analyser.smoothingTimeConstant = 0.6;
 
     const destination = ctx.createMediaStreamDestination();
+
+    // Always connect a 0-gain monitor branch to ctx.destination so Chromium/WebView2
+    // keeps the AudioWorklet render graph clocked even when 0 viewers are connected,
+    // and allows toggling local test monitoring on demand.
+    const monitorGain = ctx.createGain();
+    monitorGain.gain.value = 0;
+
     worklet.connect(analyser);
     analyser.connect(destination);
+    analyser.connect(monitorGain);
+    monitorGain.connect(ctx.destination);
 
     if (ctx.state === "suspended") {
-      await ctx.resume();
+      await ctx.resume().catch(() => {});
     }
 
     this.ctx = ctx;
     this.worklet = worklet;
     this.analyser = analyser;
+    this.monitorGain = monitorGain;
     this.destination = destination;
     this.meterBuffer = new Float32Array(new ArrayBuffer(analyser.fftSize * 4));
 
     return destination.stream.getAudioTracks()[0];
+  }
+
+  async ensureRunning(): Promise<void> {
+    if (this.ctx && this.ctx.state === "suspended") {
+      await this.ctx.resume().catch(() => {});
+    }
   }
 
   async setTargetPid(pid: number | null): Promise<void> {
@@ -96,6 +131,8 @@ export class AppAudioBridge {
     }
     this.worklet?.port.postMessage({ type: "clear" });
     this.activePid = null;
+    this.chunksReceived = 0;
+    this.lastChunkAt = 0;
 
     if (pid === null) {
       return;
@@ -108,15 +145,15 @@ export class AppAudioBridge {
     if (!this.worklet) {
       await this.init();
     }
-    if (this.ctx && this.ctx.state === "suspended") {
-      await this.ctx.resume();
-    }
+    await this.ensureRunning();
 
     const channel = new Channel<ArrayBuffer | Uint8Array | number[]>();
     channel.onmessage = (chunk) => {
       if (!this.worklet) return;
       const buf = toArrayBuffer(chunk);
       if (buf && buf.byteLength >= 8) {
+        this.chunksReceived++;
+        this.lastChunkAt = performance.now();
         this.worklet.port.postMessage(buf, [buf]);
       }
     };
@@ -132,6 +169,44 @@ export class AppAudioBridge {
 
   isMuted(): boolean {
     return this.muted;
+  }
+
+  setMonitorLocally(enabled: boolean): void {
+    this.monitoringLocally = enabled;
+    if (this.monitorGain && this.ctx) {
+      void this.ensureRunning();
+      this.monitorGain.gain.setTargetAtTime(enabled ? 0.75 : 0, this.ctx.currentTime, 0.015);
+    }
+  }
+
+  isMonitoringLocally(): boolean {
+    return this.monitoringLocally;
+  }
+
+  getStatus(): AudioBridgeStatus {
+    if (this.activePid === null) {
+      return { state: "off", label: "Audio off", chunksReceived: 0 };
+    }
+    if (this.ctx && this.ctx.state !== "running") {
+      return {
+        state: "suspended",
+        label: "Audio engine paused — click Test Sound to wake",
+        chunksReceived: this.chunksReceived,
+      };
+    }
+    const recentlyActive = this.lastChunkAt > 0 && performance.now() - this.lastChunkAt < 1200;
+    if (recentlyActive) {
+      return {
+        state: "capturing",
+        label: this.muted ? "Capturing (muted)" : "Capturing · 48 kHz stereo",
+        chunksReceived: this.chunksReceived,
+      };
+    }
+    return {
+      state: "waiting",
+      label: "Connected — waiting for app sound...",
+      chunksReceived: this.chunksReceived,
+    };
   }
 
   /** Returns normalized RMS audio level [0..1] for the host UI meter. */
@@ -154,12 +229,19 @@ export class AppAudioBridge {
       await invoke("stop_app_audio").catch(() => {});
     }
     this.activePid = null;
+    this.monitoringLocally = false;
+    this.chunksReceived = 0;
+    this.lastChunkAt = 0;
 
     if (this.destination) {
       for (const track of this.destination.stream.getTracks()) {
         track.stop();
       }
       this.destination = null;
+    }
+    if (this.monitorGain) {
+      this.monitorGain.disconnect();
+      this.monitorGain = null;
     }
     if (this.worklet) {
       this.worklet.disconnect();

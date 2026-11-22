@@ -9,6 +9,7 @@ export interface ViewerStats {
   resolution: string;
   fps: string;
   bitrate: string;
+  audio: string;
   rtt: string;
   packetLoss: string;
   codec: string;
@@ -32,6 +33,8 @@ export class ViewerManager {
   private statsTimer: number | null = null;
   private prevBytes = 0;
   private prevTimestamp = 0;
+  private prevAudioBytes = 0;
+  private prevAudioTimestamp = 0;
   private active = false;
   private callbacks: ViewerCallbacks;
 
@@ -49,7 +52,7 @@ export class ViewerManager {
         const timer = window.setTimeout(() => {
           unsub();
           reject(new Error("Timed out joining room."));
-        }, 5000);
+        }, 8000);
 
         const unsub = this.signaling.onMessage((msg) => {
           if (msg.type === "joined_room") {
@@ -72,6 +75,8 @@ export class ViewerManager {
       this.remoteSet = false;
       this.prevBytes = 0;
       this.prevTimestamp = 0;
+      this.prevAudioBytes = 0;
+      this.prevAudioTimestamp = 0;
 
       this.setupPeerConnection();
       this.signaling.onMessage((msg) => this.handleServerMessage(msg));
@@ -209,6 +214,10 @@ export class ViewerManager {
       let packetsReceived = 0;
       let packetsLost = 0;
       let codecId = "";
+      let audioBytes = 0;
+      let audioTimestamp = 0;
+      let audioLevel: number | null = null;
+      let hasAudioReport = false;
       let rttSeconds: number | null = null;
       const codecs = new Map<string, string>();
 
@@ -224,6 +233,13 @@ export class ViewerManager {
           packetsReceived = stat.packetsReceived ?? 0;
           packetsLost = stat.packetsLost ?? 0;
           codecId = stat.codecId ?? "";
+        } else if (stat.type === "inbound-rtp" && stat.kind === "audio") {
+          hasAudioReport = true;
+          audioBytes = stat.bytesReceived ?? 0;
+          audioTimestamp = stat.timestamp ?? 0;
+          if (typeof stat.audioLevel === "number") {
+            audioLevel = stat.audioLevel;
+          }
         } else if (
           stat.type === "candidate-pair" &&
           stat.state === "succeeded" &&
@@ -246,6 +262,16 @@ export class ViewerManager {
       this.prevBytes = bytesReceived;
       this.prevTimestamp = timestamp;
 
+      let audioLabel = hasAudioReport ? "Connected" : "No track";
+      if (this.prevAudioTimestamp > 0 && audioTimestamp > this.prevAudioTimestamp) {
+        const dtSec = (audioTimestamp - this.prevAudioTimestamp) / 1000;
+        const kbps = Math.round(((audioBytes - this.prevAudioBytes) * 8) / dtSec / 1000);
+        const loud = audioLevel !== null && audioLevel > 0.002 ? " · Active" : " · Silent";
+        audioLabel = `${kbps} kbps${loud}`;
+      }
+      this.prevAudioBytes = audioBytes;
+      this.prevAudioTimestamp = audioTimestamp;
+
       const totalPackets = packetsReceived + Math.max(0, packetsLost);
       const lossPct =
         totalPackets > 0 ? `${((Math.max(0, packetsLost) / totalPackets) * 100).toFixed(1)}%` : "0.0%";
@@ -254,6 +280,7 @@ export class ViewerManager {
         resolution: width && height ? `${width}×${height}` : "-",
         fps: fps ? `${Math.round(fps)} fps` : "-",
         bitrate: bitrateLabel,
+        audio: audioLabel,
         rtt: rttSeconds !== null ? `${Math.round(rttSeconds * 1000)} ms` : "-",
         packetLoss: lossPct,
         codec: codecs.get(codecId) ?? "-",

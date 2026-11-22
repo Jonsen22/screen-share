@@ -503,6 +503,59 @@ body {
   flex: 1;
 }
 
+.live-quality-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.live-quality-grid select {
+  padding: 6px 8px;
+  font-size: 12px;
+}
+
+.audio-btn-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.btn-active {
+  background: rgba(35, 165, 90, 0.2);
+  border-color: var(--success);
+  color: #7df2a8;
+}
+
+.status-capturing {
+  color: #7df2a8;
+}
+
+.status-warn {
+  color: #f0b232;
+}
+
+.unmute-overlay {
+  position: absolute;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 999px;
+  padding: 8px 18px;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+}
+
+.unmute-overlay:hover {
+  background: var(--accent-hover);
+}
+
 /* Viewer Stage */
 .viewer-stage {
   flex: 1;

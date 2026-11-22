@@ -115,6 +115,29 @@
                 <p id="host-status-text" class="muted small">Waiting for viewers to join...</p>
               </div>
 
+              <button id="btn-switch-screen" class="btn btn-primary full-width" type="button">
+                Change Screen / Window
+              </button>
+
+              <div class="live-quality-grid">
+                <div class="field">
+                  <label for="live-preset-select">Quality</label>
+                  <select id="live-preset-select">
+                    <option value="720p30">720p · 30 fps</option>
+                    <option value="1080p30">1080p · 30 fps</option>
+                    <option value="1080p60">1080p · 60 fps</option>
+                    <option value="source60">Native · 60 fps</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="live-hint-select">Priority</label>
+                  <select id="live-hint-select">
+                    <option value="motion">Motion</option>
+                    <option value="detail">Sharp Text</option>
+                  </select>
+                </div>
+              </div>
+
               <div class="divider"></div>
 
               <div class="field">
@@ -131,13 +154,18 @@
 
               <div class="meter-block">
                 <div class="field-label-row">
-                  <span class="small muted">App Audio Level</span>
-                  <button id="btn-host-mute" class="btn btn-ghost btn-sm" type="button">
-                    Mute Audio
-                  </button>
+                  <span id="host-audio-status" class="small muted">Audio off</span>
                 </div>
                 <div class="meter-track">
                   <div id="host-audio-meter" class="meter-fill"></div>
+                </div>
+                <div class="audio-btn-row">
+                  <button id="btn-host-monitor" class="btn btn-ghost btn-sm" type="button">
+                    Test Sound
+                  </button>
+                  <button id="btn-host-mute" class="btn btn-ghost btn-sm" type="button">
+                    Mute Audio
+                  </button>
                 </div>
               </div>
 
@@ -197,12 +225,17 @@
                 <span id="viewer-banner-text">Connecting to host...</span>
               </div>
 
+              <button id="btn-unmute-overlay" class="unmute-overlay hidden" type="button">
+                Click to Unmute Stream Audio
+              </button>
+
               <div id="stats-hud" class="stats-hud hidden">
                 <div class="stats-title">Stream Telemetry</div>
                 <dl class="stats-grid">
                   <dt>Resolution</dt><dd id="stat-res">-</dd>
                   <dt>FPS</dt><dd id="stat-fps">-</dd>
-                  <dt>Bitrate</dt><dd id="stat-bitrate">-</dd>
+                  <dt>Video</dt><dd id="stat-bitrate">-</dd>
+                  <dt>Audio</dt><dd id="stat-audio">-</dd>
                   <dt>Latency (RTT)</dt><dd id="stat-rtt">-</dd>
                   <dt>Packet Loss</dt><dd id="stat-loss">-</dd>
                   <dt>Codec</dt><dd id="stat-codec">-</dd>

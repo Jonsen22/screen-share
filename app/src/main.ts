@@ -24,19 +24,24 @@ const hostSetup = el<HTMLElement>("host-setup");
 const hostLive = el<HTMLElement>("host-live");
 const presetSelect = el<HTMLSelectElement>("preset-select");
 const hintSelect = el<HTMLSelectElement>("hint-select");
+const livePresetSelect = el<HTMLSelectElement>("live-preset-select");
+const liveHintSelect = el<HTMLSelectElement>("live-hint-select");
 const audioAppSelect = el<HTMLSelectElement>("audio-app-select");
 const liveAudioAppSelect = el<HTMLSelectElement>("live-audio-app-select");
 const btnRefreshApps = el<HTMLButtonElement>("btn-refresh-apps");
 const btnLiveRefreshApps = el<HTMLButtonElement>("btn-live-refresh-apps");
 const btnStartShare = el<HTMLButtonElement>("btn-start-share");
+const btnSwitchScreen = el<HTMLButtonElement>("btn-switch-screen");
 const btnStopShare = el<HTMLButtonElement>("btn-stop-share");
 const btnCopyCode = el<HTMLButtonElement>("btn-copy-code");
+const btnHostMonitor = el<HTMLButtonElement>("btn-host-monitor");
 const btnHostMute = el<HTMLButtonElement>("btn-host-mute");
 const hostPreview = el<HTMLVideoElement>("host-preview");
 const hostRoomCode = el<HTMLElement>("host-room-code");
 const hostVideoMeta = el<HTMLElement>("host-video-meta");
 const hostViewerPill = el<HTMLElement>("host-viewer-pill");
 const hostStatusText = el<HTMLElement>("host-status-text");
+const hostAudioStatus = el<HTMLElement>("host-audio-status");
 const hostAudioMeter = el<HTMLElement>("host-audio-meter");
 const hostError = el<HTMLElement>("host-error");
 const hostLiveError = el<HTMLElement>("host-live-error");
@@ -52,6 +57,7 @@ const viewerVideoWrap = el<HTMLElement>("viewer-video-wrap");
 const viewerVideo = el<HTMLVideoElement>("viewer-video");
 const viewerBanner = el<HTMLElement>("viewer-banner");
 const viewerBannerText = el<HTMLElement>("viewer-banner-text");
+const btnUnmuteOverlay = el<HTMLButtonElement>("btn-unmute-overlay");
 const viewerRoomBadge = el<HTMLElement>("viewer-room-badge");
 const btnViewerMute = el<HTMLButtonElement>("btn-viewer-mute");
 const viewerVolume = el<HTMLInputElement>("viewer-volume");
@@ -63,6 +69,7 @@ const statsHud = el<HTMLElement>("stats-hud");
 const statRes = el<HTMLElement>("stat-res");
 const statFps = el<HTMLElement>("stat-fps");
 const statBitrate = el<HTMLElement>("stat-bitrate");
+const statAudio = el<HTMLElement>("stat-audio");
 const statRtt = el<HTMLElement>("stat-rtt");
 const statLoss = el<HTMLElement>("stat-loss");
 const statCodec = el<HTMLElement>("stat-codec");
@@ -134,11 +141,16 @@ function populateAppSelect(select: HTMLSelectElement, apps: AudioAppInfo[], pres
   for (const app of apps) {
     const opt = document.createElement("option");
     opt.value = String(app.pid);
+    const badge = app.isPlayingAudio
+      ? "[Playing] "
+      : app.hasAudioSession
+        ? "[Audio] "
+        : "";
     const title =
-      app.windowTitle.length > 52
-        ? `${app.windowTitle.slice(0, 49)}...`
+      app.windowTitle.length > 46
+        ? `${app.windowTitle.slice(0, 43)}...`
         : app.windowTitle;
-    opt.textContent = `${app.processName} — ${title} (PID ${app.pid})`;
+    opt.textContent = `${badge}${app.processName} — ${title} (PID ${app.pid})`;
     select.appendChild(opt);
   }
 
@@ -162,12 +174,18 @@ async function refreshAudioApps(): Promise<void> {
 btnRefreshApps.addEventListener("click", () => void refreshAudioApps());
 btnLiveRefreshApps.addEventListener("click", () => void refreshAudioApps());
 
-// Audio meter animation loop while hosting
+// Audio meter & status animation loop while hosting
 function startMeterLoop(): void {
   const tick = () => {
     if (!isHosting) return;
     const level = hostManager.getAudioLevel();
     hostAudioMeter.style.width = `${Math.round(level * 100)}%`;
+
+    const status = hostManager.getAudioStatus();
+    hostAudioStatus.textContent = status.label;
+    hostAudioStatus.classList.toggle("status-capturing", status.state === "capturing");
+    hostAudioStatus.classList.toggle("status-warn", status.state === "suspended");
+
     meterRafId = window.requestAnimationFrame(tick);
   };
   meterRafId = window.requestAnimationFrame(tick);
@@ -179,6 +197,16 @@ function stopMeterLoop(): void {
     meterRafId = null;
   }
   hostAudioMeter.style.width = "0%";
+  hostAudioStatus.textContent = "Audio off";
+  hostAudioStatus.classList.remove("status-capturing", "status-warn");
+}
+
+function attachHostPreview(previewStream: MediaStream): void {
+  hostPreview.srcObject = previewStream;
+  hostPreview.onloadedmetadata = () => {
+    hostVideoMeta.textContent = hostManager.getVideoMeta();
+  };
+  hostVideoMeta.textContent = hostManager.getVideoMeta();
 }
 
 // Host Manager
@@ -193,19 +221,23 @@ const hostManager = new HostManager({
     hostRoomCode.textContent = code;
     hostViewerPill.textContent = `0 / ${maxViewers} Viewers`;
     hostStatusText.textContent = "Share this code with up to 5 viewers.";
-    hostPreview.srcObject = previewStream;
+    livePresetSelect.value = presetSelect.value;
+    liveHintSelect.value = hintSelect.value;
     liveAudioAppSelect.value = audioAppSelect.value;
     btnHostMute.textContent = "Mute Audio";
+    btnHostMute.classList.remove("btn-active");
+    btnHostMonitor.textContent = "Test Sound";
+    btnHostMonitor.classList.remove("btn-active");
+
+    attachHostPreview(previewStream);
 
     hostSetup.classList.add("hidden");
     hostLive.classList.remove("hidden");
-
-    // Read resolved capture metadata once the first frame arrives
-    hostPreview.onloadedmetadata = () => {
-      hostVideoMeta.textContent = hostManager.getVideoMeta();
-    };
-    hostVideoMeta.textContent = hostManager.getVideoMeta();
     startMeterLoop();
+  },
+
+  onStreamChanged(previewStream) {
+    attachHostPreview(previewStream);
   },
 
   onViewerCountChange(count, maxViewers) {
@@ -227,6 +259,8 @@ const hostManager = new HostManager({
     hostSetup.classList.remove("hidden");
     btnStartShare.disabled = false;
     btnStartShare.textContent = "Pick Screen & Start Sharing";
+    btnSwitchScreen.disabled = false;
+    btnSwitchScreen.textContent = "Change Screen / Window";
 
     if (reason) {
       showAlert(hostError, reason);
@@ -258,6 +292,37 @@ btnStartShare.addEventListener("click", async () => {
   }
 });
 
+btnSwitchScreen.addEventListener("click", async () => {
+  showAlert(hostLiveError, null);
+  btnSwitchScreen.disabled = true;
+  btnSwitchScreen.textContent = "Picking screen...";
+  try {
+    await hostManager.switchScreen();
+  } catch (err) {
+    showAlert(hostLiveError, err instanceof Error ? err.message : String(err));
+  } finally {
+    btnSwitchScreen.disabled = false;
+    btnSwitchScreen.textContent = "Change Screen / Window";
+  }
+});
+
+async function handleLiveQualityChange(): Promise<void> {
+  showAlert(hostLiveError, null);
+  const preset = livePresetSelect.value as QualityPresetId;
+  const hint = liveHintSelect.value as ContentHintMode;
+  presetSelect.value = preset;
+  hintSelect.value = hint;
+  try {
+    await hostManager.updateQuality(preset, hint);
+    hostVideoMeta.textContent = hostManager.getVideoMeta();
+  } catch (err) {
+    showAlert(hostLiveError, err instanceof Error ? err.message : String(err));
+  }
+}
+
+livePresetSelect.addEventListener("change", () => void handleLiveQualityChange());
+liveHintSelect.addEventListener("change", () => void handleLiveQualityChange());
+
 btnStopShare.addEventListener("click", () => {
   void hostManager.stop();
 });
@@ -285,10 +350,18 @@ liveAudioAppSelect.addEventListener("change", async () => {
   }
 });
 
+btnHostMonitor.addEventListener("click", () => {
+  const next = !hostManager.isMonitoringLocally();
+  hostManager.setMonitorLocally(next);
+  btnHostMonitor.textContent = next ? "Stop Test Sound" : "Test Sound";
+  btnHostMonitor.classList.toggle("btn-active", next);
+});
+
 btnHostMute.addEventListener("click", () => {
   const nextMuted = !hostManager.isAudioMuted();
   hostManager.setAudioMuted(nextMuted);
   btnHostMute.textContent = nextMuted ? "Unmute Audio" : "Mute Audio";
+  btnHostMute.classList.toggle("btn-active", nextMuted);
 });
 
 // Viewer Manager
@@ -297,6 +370,7 @@ const viewerManager = new ViewerManager({
     isWatching = true;
     setTabsLocked(true);
     showAlert(viewerError, null);
+    btnUnmuteOverlay.classList.add("hidden");
     viewerRoomBadge.textContent = `Room ${code}`;
     viewerJoin.classList.add("hidden");
     viewerStage.classList.remove("hidden");
@@ -306,7 +380,15 @@ const viewerManager = new ViewerManager({
     if (viewerVideo.srcObject !== stream) {
       viewerVideo.srcObject = stream;
     }
-    void viewerVideo.play().catch(() => {});
+    viewerVideo.muted = Number(viewerVolume.value) === 0;
+    viewerVideo.volume = Number(viewerVolume.value);
+    void viewerVideo.play().catch(() => {
+      // Browser blocked unmuted autoplay — start muted and prompt user with one-click unmute
+      viewerVideo.muted = true;
+      btnViewerMute.textContent = "Unmute";
+      btnUnmuteOverlay.classList.remove("hidden");
+      void viewerVideo.play().catch(() => {});
+    });
   },
 
   onBanner(text) {
@@ -322,6 +404,7 @@ const viewerManager = new ViewerManager({
     statRes.textContent = stats.resolution;
     statFps.textContent = stats.fps;
     statBitrate.textContent = stats.bitrate;
+    statAudio.textContent = stats.audio;
     statRtt.textContent = stats.rtt;
     statLoss.textContent = stats.packetLoss;
     statCodec.textContent = stats.codec;
@@ -336,6 +419,7 @@ const viewerManager = new ViewerManager({
       void document.exitFullscreen().catch(() => {});
     }
     viewerVideo.srcObject = null;
+    btnUnmuteOverlay.classList.add("hidden");
     viewerStage.classList.add("hidden");
     viewerJoin.classList.remove("hidden");
     btnJoinRoom.disabled = false;
@@ -345,6 +429,17 @@ const viewerManager = new ViewerManager({
       showAlert(viewerError, reason);
     }
   },
+});
+
+btnUnmuteOverlay.addEventListener("click", () => {
+  viewerVideo.muted = false;
+  if (Number(viewerVolume.value) === 0) {
+    viewerVolume.value = "1";
+  }
+  viewerVideo.volume = Number(viewerVolume.value);
+  btnViewerMute.textContent = "Mute";
+  btnUnmuteOverlay.classList.add("hidden");
+  void viewerVideo.play().catch(() => {});
 });
 
 // Auto-format room code input as XXXX-XXXX
@@ -385,11 +480,17 @@ viewerVolume.addEventListener("input", () => {
   viewerVideo.volume = vol;
   viewerVideo.muted = vol === 0;
   btnViewerMute.textContent = viewerVideo.muted ? "Unmute" : "Mute";
+  if (!viewerVideo.muted) {
+    btnUnmuteOverlay.classList.add("hidden");
+  }
 });
 
 btnViewerMute.addEventListener("click", () => {
   viewerVideo.muted = !viewerVideo.muted;
   btnViewerMute.textContent = viewerVideo.muted ? "Unmute" : "Mute";
+  if (!viewerVideo.muted) {
+    btnUnmuteOverlay.classList.add("hidden");
+  }
 });
 
 function toggleStats(): void {

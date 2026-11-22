@@ -6,6 +6,8 @@ pub struct AudioAppInfo {
     pub pid: u32,
     pub process_name: String,
     pub window_title: String,
+    pub has_audio_session: bool,
+    pub is_playing_audio: bool,
 }
 
 #[cfg(windows)]
@@ -14,23 +16,24 @@ pub fn enumerate_audio_apps() -> Result<Vec<AudioAppInfo>, String> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
     use std::path::Path;
-    use windows::core::PWSTR;
-    use windows::Win32::Foundation::{BOOL, CloseHandle, HWND, LPARAM, TRUE};
+    use windows::core::{Interface, PWSTR};
+    use windows::Win32::Foundation::{BOOL, CloseHandle, FALSE, HWND, LPARAM, RPC_E_CHANGED_MODE, TRUE};
     use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+    use windows::Win32::Media::Audio::{
+        eConsole, eRender, AudioSessionStateActive, AudioSessionStateExpired, IAudioSessionControl2,
+        IAudioSessionManager2, IMMDeviceEnumerator, MMDeviceEnumerator,
+    };
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
+    };
     use windows::Win32::System::Threading::{
         GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
         PROCESS_QUERY_LIMITED_INFORMATION,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetShellWindow, GetWindowLongW, GetWindowTextLengthW, GetWindowTextW,
-        GetWindowThreadProcessId, GWL_EXSTYLE, IsWindowVisible, WS_EX_TOOLWINDOW,
+        EnumChildWindows, EnumWindows, GetShellWindow, GetWindowLongW, GetWindowTextLengthW,
+        GetWindowTextW, GetWindowThreadProcessId, GWL_EXSTYLE, IsWindowVisible, WS_EX_TOOLWINDOW,
     };
-
-    struct EnumContext {
-        self_pid: u32,
-        shell_hwnd: HWND,
-        by_pid: HashMap<u32, AudioAppInfo>,
-    }
 
     fn query_process_name(pid: u32) -> Option<String> {
         unsafe {
@@ -55,6 +58,99 @@ pub fn enumerate_audio_apps() -> Result<Vec<AudioAppInfo>, String> {
         }
     }
 
+    /// Resolve UWP apps hosted inside ApplicationFrameHost.exe to their real CoreWindow PID.
+    fn resolve_uwp_child_pid(parent_hwnd: HWND, host_pid: u32) -> u32 {
+        struct ChildCtx {
+            host_pid: u32,
+            found_pid: u32,
+        }
+
+        unsafe extern "system" fn child_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            let ctx = &mut *(lparam.0 as *mut ChildCtx);
+            let mut pid: u32 = 0;
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            if pid != 0 && pid != ctx.host_pid {
+                ctx.found_pid = pid;
+                return FALSE;
+            }
+            TRUE
+        }
+
+        let mut ctx = ChildCtx {
+            host_pid,
+            found_pid: host_pid,
+        };
+        unsafe {
+            let _ = EnumChildWindows(
+                parent_hwnd,
+                Some(child_cb),
+                LPARAM(&mut ctx as *mut ChildCtx as isize),
+            );
+        }
+        ctx.found_pid
+    }
+
+    /// Query Windows Volume Mixer (IAudioSessionManager2) for processes with active/open audio sessions.
+    fn query_wasapi_audio_sessions(self_pid: u32) -> HashMap<u32, bool> {
+        let mut sessions: HashMap<u32, bool> = HashMap::new();
+        unsafe {
+            let com_hr = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let should_uninit = com_hr.is_ok();
+            if com_hr.is_err() && com_hr != RPC_E_CHANGED_MODE {
+                return sessions;
+            }
+
+            let _ = (|| -> windows::core::Result<()> {
+                let enumerator: IMMDeviceEnumerator =
+                    CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+                let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
+                let manager: IAudioSessionManager2 = device.Activate(CLSCTX_ALL, None)?;
+                let list = manager.GetSessionEnumerator()?;
+                let count = list.GetCount()?;
+
+                for i in 0..count {
+                    let Ok(ctrl) = list.GetSession(i) else {
+                        continue;
+                    };
+                    let Ok(ctrl2) = ctrl.cast::<IAudioSessionControl2>() else {
+                        continue;
+                    };
+                    let Ok(pid) = ctrl2.GetProcessId() else {
+                        continue;
+                    };
+                    if pid == 0 || pid == self_pid {
+                        continue;
+                    }
+                    let state = ctrl.GetState().unwrap_or(AudioSessionStateExpired);
+                    if state == AudioSessionStateExpired {
+                        continue;
+                    }
+                    let is_active = state == AudioSessionStateActive;
+                    sessions
+                        .entry(pid)
+                        .and_modify(|playing| {
+                            if is_active {
+                                *playing = true;
+                            }
+                        })
+                        .or_insert(is_active);
+                }
+                Ok(())
+            })();
+
+            if should_uninit {
+                CoUninitialize();
+            }
+        }
+        sessions
+    }
+
+    struct EnumContext {
+        self_pid: u32,
+        shell_hwnd: HWND,
+        by_pid: HashMap<u32, AudioAppInfo>,
+    }
+
     unsafe extern "system" fn enum_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
         let ctx = &mut *(lparam.0 as *mut EnumContext);
 
@@ -62,13 +158,11 @@ pub fn enumerate_audio_apps() -> Result<Vec<AudioAppInfo>, String> {
             return TRUE;
         }
 
-        // Skip floating tool windows
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
         if (ex_style & WS_EX_TOOLWINDOW.0) != 0 {
             return TRUE;
         }
 
-        // Skip cloaked UWP background windows
         let mut cloaked: u32 = 0;
         let _ = DwmGetWindowAttribute(
             hwnd,
@@ -103,28 +197,38 @@ pub fn enumerate_audio_apps() -> Result<Vec<AudioAppInfo>, String> {
             return TRUE;
         }
 
+        let mut process_name = query_process_name(pid).unwrap_or_else(|| format!("PID {pid}"));
+        if process_name.eq_ignore_ascii_case("ApplicationFrameHost") {
+            let real_pid = resolve_uwp_child_pid(hwnd, pid);
+            if real_pid != pid && real_pid != ctx.self_pid {
+                pid = real_pid;
+                process_name = query_process_name(pid).unwrap_or(process_name);
+            }
+        }
+
         if let Some(existing) = ctx.by_pid.get_mut(&pid) {
-            // Keep the most descriptive (longest) top-level window title for this PID
             if window_title.len() > existing.window_title.len() {
                 existing.window_title = window_title;
             }
             return TRUE;
         }
 
-        let process_name = query_process_name(pid).unwrap_or_else(|| format!("PID {pid}"));
         ctx.by_pid.insert(
             pid,
             AudioAppInfo {
                 pid,
                 process_name,
                 window_title,
+                has_audio_session: false,
+                is_playing_audio: false,
             },
         );
         TRUE
     }
 
+    let self_pid = unsafe { GetCurrentProcessId() };
     let mut ctx = EnumContext {
-        self_pid: unsafe { GetCurrentProcessId() },
+        self_pid,
         shell_hwnd: unsafe { GetShellWindow() },
         by_pid: HashMap::new(),
     };
@@ -137,11 +241,38 @@ pub fn enumerate_audio_apps() -> Result<Vec<AudioAppInfo>, String> {
         .map_err(|e| format!("EnumWindows failed: {e}"))?;
     }
 
+    // Merge active WASAPI audio sessions from Windows Volume Mixer
+    let audio_sessions = query_wasapi_audio_sessions(self_pid);
+    for (pid, is_playing) in audio_sessions {
+        if let Some(existing) = ctx.by_pid.get_mut(&pid) {
+            existing.has_audio_session = true;
+            existing.is_playing_audio = is_playing;
+        } else {
+            let process_name = query_process_name(pid).unwrap_or_else(|| format!("PID {pid}"));
+            let window_title = if is_playing {
+                "Playing audio (background / audio process)".to_string()
+            } else {
+                "Open audio session".to_string()
+            };
+            ctx.by_pid.insert(
+                pid,
+                AudioAppInfo {
+                    pid,
+                    process_name,
+                    window_title,
+                    has_audio_session: true,
+                    is_playing_audio: is_playing,
+                },
+            );
+        }
+    }
+
     let mut apps: Vec<AudioAppInfo> = ctx.by_pid.into_values().collect();
     apps.sort_by(|a, b| {
-        a.process_name
-            .to_lowercase()
-            .cmp(&b.process_name.to_lowercase())
+        b.is_playing_audio
+            .cmp(&a.is_playing_audio)
+            .then_with(|| b.has_audio_session.cmp(&a.has_audio_session))
+            .then_with(|| a.process_name.to_lowercase().cmp(&b.process_name.to_lowercase()))
             .then_with(|| a.window_title.to_lowercase().cmp(&b.window_title.to_lowercase()))
     });
     Ok(apps)

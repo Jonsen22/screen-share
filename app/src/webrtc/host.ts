@@ -1,4 +1,4 @@
-import { AppAudioBridge } from "../audio/app-audio";
+import { AppAudioBridge, AudioBridgeStatus } from "../audio/app-audio";
 import { SignalingClient, ServerMessage } from "./signaling";
 
 export type QualityPresetId = "720p30" | "1080p30" | "1080p60" | "source60";
@@ -32,6 +32,7 @@ export interface HostStartOptions {
 
 export interface HostCallbacks {
   onRoomCreated: (code: string, maxViewers: number, previewStream: MediaStream) => void;
+  onStreamChanged: (previewStream: MediaStream) => void;
   onViewerCountChange: (count: number, maxViewers: number) => void;
   onEnded: (reason?: string) => void;
   onError: (message: string) => void;
@@ -39,6 +40,7 @@ export interface HostCallbacks {
 
 interface ViewerPeer {
   pc: RTCPeerConnection;
+  videoSender: RTCRtpSender | null;
   pendingIce: RTCIceCandidateInit[];
   remoteSet: boolean;
 }
@@ -85,6 +87,7 @@ export class HostManager {
   private audioBridge = new AppAudioBridge();
   private videoStream: MediaStream | null = null;
   private outboundStream: MediaStream | null = null;
+  private videoEndedHandler: (() => void) | null = null;
   private peers = new Map<string, ViewerPeer>();
   private preset: PresetConfig = PRESETS["1080p30"];
   private contentHint: ContentHintMode = "motion";
@@ -96,28 +99,53 @@ export class HostManager {
     this.callbacks = callbacks;
   }
 
+  private buildVideoConstraints(): MediaTrackConstraints {
+    const constraints: MediaTrackConstraints = {
+      frameRate: { ideal: this.preset.frameRate, max: this.preset.frameRate },
+    };
+    if (this.preset.width && this.preset.height) {
+      constraints.width = { ideal: this.preset.width, max: this.preset.width };
+      constraints.height = { ideal: this.preset.height, max: this.preset.height };
+    }
+    return constraints;
+  }
+
+  private attachVideoEndedHandler(track: MediaStreamTrack): void {
+    const handler = () => {
+      if (this.active && this.videoStream?.getVideoTracks()[0] === track) {
+        void this.stop("Screen sharing ended from system controls.");
+      }
+    };
+    this.videoEndedHandler = handler;
+    track.addEventListener("ended", handler);
+  }
+
+  private detachVideoEndedHandler(track: MediaStreamTrack | undefined): void {
+    if (track && this.videoEndedHandler) {
+      track.removeEventListener("ended", this.videoEndedHandler);
+    }
+    this.videoEndedHandler = null;
+  }
+
   async start(options: HostStartOptions): Promise<void> {
     if (this.active) return;
 
     this.preset = PRESETS[options.preset];
     this.contentHint = options.contentHint;
 
-    const videoConstraints: MediaTrackConstraints = {
-      frameRate: { ideal: this.preset.frameRate, max: this.preset.frameRate },
-    };
-    if (this.preset.width && this.preset.height) {
-      videoConstraints.width = { ideal: this.preset.width, max: this.preset.width };
-      videoConstraints.height = { ideal: this.preset.height, max: this.preset.height };
-    }
+    // Initialize AudioContext BEFORE opening the async screen picker so it stays
+    // unlocked by the user's click gesture in Chromium/WebView2.
+    const audioTrack = await this.audioBridge.init();
 
     // Always capture video with audio: false so system audio is never leaked
     let videoStream: MediaStream;
     try {
       videoStream = await navigator.mediaDevices.getDisplayMedia({
-        video: videoConstraints,
+        video: this.buildVideoConstraints(),
         audio: false,
       });
     } catch (err) {
+      await this.audioBridge.dispose();
       const name = err instanceof DOMException ? err.name : "";
       if (name === "NotAllowedError" || name === "AbortError") {
         throw new Error("Screen capture was cancelled.");
@@ -128,6 +156,7 @@ export class HostManager {
     const videoTrack = videoStream.getVideoTracks()[0];
     if (!videoTrack) {
       videoStream.getTracks().forEach((t) => t.stop());
+      await this.audioBridge.dispose();
       throw new Error("No video track returned by screen picker.");
     }
 
@@ -138,7 +167,7 @@ export class HostManager {
     this.videoStream = videoStream;
 
     try {
-      const audioTrack = await this.audioBridge.init();
+      await this.audioBridge.ensureRunning();
       if (options.audioPid !== null) {
         await this.audioBridge.setTargetPid(options.audioPid);
       }
@@ -152,7 +181,7 @@ export class HostManager {
           const timer = window.setTimeout(() => {
             unsub();
             reject(new Error("Timed out waiting for room creation."));
-          }, 5000);
+          }, 8000);
 
           const unsub = this.signaling.onMessage((msg) => {
             if (msg.type === "room_created") {
@@ -180,11 +209,7 @@ export class HostManager {
         }
       });
 
-      videoTrack.addEventListener("ended", () => {
-        if (this.active) {
-          void this.stop("Screen sharing ended from system controls.");
-        }
-      });
+      this.attachVideoEndedHandler(videoTrack);
 
       this.callbacks.onRoomCreated(roomInfo.code, roomInfo.maxViewers, videoStream);
       this.callbacks.onViewerCountChange(0, this.maxViewers);
@@ -192,6 +217,108 @@ export class HostManager {
       await this.cleanup();
       throw err;
     }
+  }
+
+  /**
+   * Opens the Windows screen/window picker and seamlessly swaps the outgoing
+   * video track on all connected viewers via RTCRtpSender.replaceTrack()
+   * without closing or reconnecting the room.
+   * Returns true if switched, false if the user cancelled the picker.
+   */
+  async switchScreen(): Promise<boolean> {
+    if (!this.active) return false;
+
+    let nextStream: MediaStream;
+    try {
+      nextStream = await navigator.mediaDevices.getDisplayMedia({
+        video: this.buildVideoConstraints(),
+        audio: false,
+      });
+    } catch (err) {
+      const name = err instanceof DOMException ? err.name : "";
+      if (name === "NotAllowedError" || name === "AbortError") {
+        // User cancelled picker — keep existing stream running untouched
+        return false;
+      }
+      throw new Error(`Failed to switch screen: ${String(err)}`);
+    }
+
+    const nextTrack = nextStream.getVideoTracks()[0];
+    if (!nextTrack) {
+      nextStream.getTracks().forEach((t) => t.stop());
+      throw new Error("No video track returned by screen picker.");
+    }
+
+    if ("contentHint" in nextTrack) {
+      nextTrack.contentHint = this.contentHint;
+    }
+
+    const prevStream = this.videoStream;
+    const prevTrack = prevStream?.getVideoTracks()[0];
+
+    // Swap track on all active viewer peer connections seamlessly
+    const replaceTasks: Promise<void>[] = [];
+    for (const peer of this.peers.values()) {
+      if (peer.videoSender) {
+        const sender = peer.videoSender;
+        replaceTasks.push(
+          sender.replaceTrack(nextTrack).then(() => this.configureSender(sender, "video"))
+        );
+      }
+    }
+    await Promise.all(replaceTasks);
+
+    // Update outboundStream so any future viewers joining receive the new track
+    if (this.outboundStream) {
+      for (const oldTrack of this.outboundStream.getVideoTracks()) {
+        this.outboundStream.removeTrack(oldTrack);
+      }
+      this.outboundStream.addTrack(nextTrack);
+    }
+
+    // Detach old ended handler BEFORE stopping old track so room stays open
+    this.detachVideoEndedHandler(prevTrack);
+    if (prevStream) {
+      for (const t of prevStream.getTracks()) {
+        t.stop();
+      }
+    }
+
+    this.videoStream = nextStream;
+    this.attachVideoEndedHandler(nextTrack);
+    this.callbacks.onStreamChanged(nextStream);
+    return true;
+  }
+
+  /**
+   * Live-updates quality preset (bitrate/framerate/resolution constraints) and
+   * encoding contentHint for all connected viewers without interrupting the room.
+   */
+  async updateQuality(presetId: QualityPresetId, contentHint: ContentHintMode): Promise<void> {
+    this.preset = PRESETS[presetId];
+    this.contentHint = contentHint;
+
+    if (!this.active) return;
+
+    const videoTrack = this.videoStream?.getVideoTracks()[0];
+    if (videoTrack) {
+      if ("contentHint" in videoTrack) {
+        videoTrack.contentHint = contentHint;
+      }
+      try {
+        await videoTrack.applyConstraints(this.buildVideoConstraints());
+      } catch {
+        // Some capture sources only apply new resolution constraints on next picker switch
+      }
+    }
+
+    const tasks: Promise<void>[] = [];
+    for (const peer of this.peers.values()) {
+      if (peer.videoSender) {
+        tasks.push(this.configureSender(peer.videoSender, "video"));
+      }
+    }
+    await Promise.all(tasks);
   }
 
   async switchAudioApp(pid: number | null): Promise<void> {
@@ -205,6 +332,18 @@ export class HostManager {
 
   isAudioMuted(): boolean {
     return this.audioBridge.isMuted();
+  }
+
+  setMonitorLocally(enabled: boolean): void {
+    this.audioBridge.setMonitorLocally(enabled);
+  }
+
+  isMonitoringLocally(): boolean {
+    return this.audioBridge.isMonitoringLocally();
+  }
+
+  getAudioStatus(): AudioBridgeStatus {
+    return this.audioBridge.getStatus();
   }
 
   getAudioLevel(): number {
@@ -245,9 +384,12 @@ export class HostManager {
     this.signaling.close();
     await this.audioBridge.dispose();
 
+    const track = this.videoStream?.getVideoTracks()[0];
+    this.detachVideoEndedHandler(track);
+
     if (this.videoStream) {
-      for (const track of this.videoStream.getTracks()) {
-        track.stop();
+      for (const t of this.videoStream.getTracks()) {
+        t.stop();
       }
       this.videoStream = null;
     }
@@ -281,11 +423,14 @@ export class HostManager {
     this.removePeer(viewerId);
 
     const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-    const entry: ViewerPeer = { pc, pendingIce: [], remoteSet: false };
+    const entry: ViewerPeer = { pc, videoSender: null, pendingIce: [], remoteSet: false };
     this.peers.set(viewerId, entry);
 
     for (const track of this.outboundStream.getTracks()) {
       const sender = pc.addTrack(track, this.outboundStream);
+      if (track.kind === "video") {
+        entry.videoSender = sender;
+      }
       void this.configureSender(sender, track.kind);
     }
 
