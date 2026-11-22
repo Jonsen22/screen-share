@@ -5,16 +5,30 @@ import { WebSocketServer, WebSocket } from "ws";
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || "0.0.0.0";
 const MAX_VIEWERS = 5;
+const HOST_GRACE_MS = 60_000;
+const VIEWER_GRACE_MS = 30_000;
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 const MAX_NICKNAME_LEN = 24;
-const LATEST_APP_VERSION = (process.env.LATEST_APP_VERSION || "0.1.0").trim();
+const LATEST_APP_VERSION = (process.env.LATEST_APP_VERSION || "1.1.0").trim();
 const APP_DOWNLOAD_URL = (
   process.env.APP_DOWNLOAD_URL || "https://github.com/Jonsen22/screen-share/releases/latest"
 ).trim();
 const APP_RELEASE_NOTES = (process.env.APP_RELEASE_NOTES || "").trim();
 
-/** @type {Map<string, { host: WebSocket, hostNickname: string, viewers: Map<string, { ws: WebSocket, nickname: string }>, createdAt: number }>} */
+/**
+ * @typedef {{
+ *   host: WebSocket | null,
+ *   hostToken: string,
+ *   hostNickname: string,
+ *   hostGraceTimer: NodeJS.Timeout | null,
+ *   viewers: Map<string, { ws: WebSocket, nickname: string }>,
+ *   viewerGraceTimers: Map<string, NodeJS.Timeout>,
+ *   createdAt: number
+ * }} Room
+ */
+
+/** @type {Map<string, Room>} */
 const rooms = new Map();
 
 function sanitizeNickname(input, fallback) {
@@ -47,13 +61,48 @@ function normalizeCode(input) {
   return `${cleaned.slice(0, 4)}-${cleaned.slice(4)}`;
 }
 
+function isValidNormalizedCode(code) {
+  return /^[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(code);
+}
+
 function sendJson(ws, message) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(message));
   }
 }
 
-function cleanupClient(ws) {
+function destroyRoom(code, notifyViewers, reason) {
+  const room = rooms.get(code);
+  if (!room) return;
+
+  if (room.hostGraceTimer) {
+    clearTimeout(room.hostGraceTimer);
+    room.hostGraceTimer = null;
+  }
+  for (const timer of room.viewerGraceTimers.values()) {
+    clearTimeout(timer);
+  }
+  room.viewerGraceTimers.clear();
+
+  if (room.host) {
+    room.host._meta = null;
+    room.host = null;
+  }
+
+  for (const viewer of room.viewers.values()) {
+    viewer.ws._meta = null;
+    if (notifyViewers) {
+      sendJson(viewer.ws, {
+        type: "room_closed",
+        reason: reason || "Host ended the stream.",
+      });
+    }
+  }
+  room.viewers.clear();
+  rooms.delete(code);
+}
+
+function cleanupClient(ws, explicit = false) {
   const meta = ws._meta;
   if (!meta) return;
   ws._meta = null;
@@ -62,38 +111,87 @@ function cleanupClient(ws) {
   if (!room) return;
 
   if (meta.role === "host") {
-    for (const viewer of room.viewers.values()) {
-      viewer.ws._meta = null;
-      sendJson(viewer.ws, {
-        type: "room_closed",
-        reason: "Host ended the stream.",
-      });
+    if (room.host !== ws) return;
+    if (explicit) {
+      destroyRoom(meta.code, true, "Host ended the stream.");
+      console.log(`[room ${meta.code}] closed (host ended stream)`);
+      return;
     }
-    room.viewers.clear();
-    rooms.delete(meta.code);
-    console.log(`[room ${meta.code}] closed (host left)`);
+
+    // Unexpected host socket drop: keep room alive during grace period so host
+    // can reclaim it without disrupting live P2P viewers.
+    room.host = null;
+    if (room.hostGraceTimer) clearTimeout(room.hostGraceTimer);
+    room.hostGraceTimer = setTimeout(() => {
+      const current = rooms.get(meta.code);
+      if (current && current.host === null) {
+        destroyRoom(meta.code, false, "");
+        console.log(`[room ${meta.code}] expired after host grace timeout`);
+      }
+    }, HOST_GRACE_MS);
+    console.log(
+      `[room ${meta.code}] host socket dropped; waiting ${HOST_GRACE_MS / 1000}s for reclaim`
+    );
   } else if (meta.role === "viewer") {
     const existing = room.viewers.get(meta.viewerId);
-    if (existing && room.viewers.delete(meta.viewerId)) {
+    if (!existing || existing.ws !== ws) return;
+
+    if (explicit) {
+      const pending = room.viewerGraceTimers.get(meta.viewerId);
+      if (pending) {
+        clearTimeout(pending);
+        room.viewerGraceTimers.delete(meta.viewerId);
+      }
+      room.viewers.delete(meta.viewerId);
       sendJson(room.host, {
         type: "viewer_left",
         viewerId: meta.viewerId,
         nickname: existing.nickname,
         viewerCount: room.viewers.size,
+        explicit: true,
       });
       console.log(
         `[room ${meta.code}] viewer ${meta.viewerId} (${existing.nickname}) left (${room.viewers.size}/${MAX_VIEWERS})`
       );
+      return;
     }
+
+    const existingTimer = room.viewerGraceTimers.get(meta.viewerId);
+    if (existingTimer) clearTimeout(existingTimer);
+    const timer = setTimeout(() => {
+      const r = rooms.get(meta.code);
+      if (!r) return;
+      r.viewerGraceTimers.delete(meta.viewerId);
+      const current = r.viewers.get(meta.viewerId);
+      if (current && current.ws === ws) {
+        r.viewers.delete(meta.viewerId);
+        sendJson(r.host, {
+          type: "viewer_left",
+          viewerId: meta.viewerId,
+          nickname: current.nickname,
+          viewerCount: r.viewers.size,
+          explicit: false,
+        });
+        console.log(
+          `[room ${meta.code}] viewer ${meta.viewerId} (${current.nickname}) timed out (${r.viewers.size}/${MAX_VIEWERS})`
+        );
+      }
+    }, VIEWER_GRACE_MS);
+    room.viewerGraceTimers.set(meta.viewerId, timer);
   }
 }
 
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
+    res.writeHead(200, {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "no-store",
+    });
     res.end(
       JSON.stringify({
         status: "ok",
+        version: LATEST_APP_VERSION,
         rooms: rooms.size,
         maxViewers: MAX_VIEWERS,
       })
@@ -130,6 +228,7 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("message", (raw) => {
+    ws._isAlive = true;
     let msg;
     try {
       msg = JSON.parse(raw.toString("utf8"));
@@ -139,29 +238,106 @@ wss.on("connection", (ws) => {
     }
 
     switch (msg.type) {
+      case "ping": {
+        sendJson(ws, { type: "pong" });
+        break;
+      }
+
       case "create_room": {
-        cleanupClient(ws);
+        cleanupClient(ws, true);
         const code = generateRoomCode();
+        const hostToken = crypto.randomBytes(16).toString("hex");
         const hostNickname = sanitizeNickname(msg.nickname, "Host");
         rooms.set(code, {
           host: ws,
+          hostToken,
           hostNickname,
+          hostGraceTimer: null,
           viewers: new Map(),
+          viewerGraceTimers: new Map(),
           createdAt: Date.now(),
         });
         ws._meta = { role: "host", code, nickname: hostNickname };
         sendJson(ws, {
           type: "room_created",
           code,
+          hostToken,
           maxViewers: MAX_VIEWERS,
         });
         console.log(`[room ${code}] created by ${hostNickname}`);
         break;
       }
 
+      case "reclaim_room": {
+        const code = normalizeCode(msg.code);
+        const hostToken = typeof msg.hostToken === "string" ? msg.hostToken : "";
+        const hostNickname = sanitizeNickname(msg.nickname, "Host");
+        if (!isValidNormalizedCode(code) || hostToken.length < 16) {
+          sendJson(ws, {
+            type: "error",
+            code: "INVALID_RECLAIM",
+            message: "Invalid room reclaim credentials.",
+          });
+          return;
+        }
+
+        const existing = rooms.get(code);
+        if (existing) {
+          if (existing.hostToken !== hostToken) {
+            sendJson(ws, {
+              type: "error",
+              code: "RECLAIM_DENIED",
+              message: "Room token mismatch.",
+            });
+            return;
+          }
+          if (existing.hostGraceTimer) {
+            clearTimeout(existing.hostGraceTimer);
+            existing.hostGraceTimer = null;
+          }
+          if (existing.host && existing.host !== ws) {
+            existing.host._meta = null;
+            try {
+              existing.host.close();
+            } catch {
+              // Ignore
+            }
+          }
+          existing.host = ws;
+          ws._meta = { role: "host", code, nickname: existing.hostNickname };
+          sendJson(ws, {
+            type: "room_reclaimed",
+            code,
+            maxViewers: MAX_VIEWERS,
+            viewerCount: existing.viewers.size,
+          });
+          console.log(`[room ${code}] reclaimed by ${existing.hostNickname}`);
+        } else {
+          // Server restarted while host was still streaming P2P; recreate room with same code.
+          rooms.set(code, {
+            host: ws,
+            hostToken,
+            hostNickname,
+            hostGraceTimer: null,
+            viewers: new Map(),
+            viewerGraceTimers: new Map(),
+            createdAt: Date.now(),
+          });
+          ws._meta = { role: "host", code, nickname: hostNickname };
+          sendJson(ws, {
+            type: "room_reclaimed",
+            code,
+            maxViewers: MAX_VIEWERS,
+            viewerCount: 0,
+          });
+          console.log(`[room ${code}] recreated by ${hostNickname} after restart`);
+        }
+        break;
+      }
+
       case "close_room": {
         if (ws._meta?.role === "host") {
-          cleanupClient(ws);
+          cleanupClient(ws, true);
         }
         break;
       }
@@ -200,10 +376,10 @@ wss.on("connection", (ws) => {
       }
 
       case "join_room": {
-        cleanupClient(ws);
+        cleanupClient(ws, true);
         const code = normalizeCode(msg.code);
         const room = rooms.get(code);
-        if (!room) {
+        if (!room || !room.host) {
           sendJson(ws, {
             type: "error",
             code: "ROOM_NOT_FOUND",
@@ -245,9 +421,28 @@ wss.on("connection", (ws) => {
         break;
       }
 
+      case "reattach_viewer": {
+        const code = normalizeCode(msg.code);
+        const viewerId = typeof msg.viewerId === "string" ? msg.viewerId : "";
+        const room = rooms.get(code);
+        if (!room || !viewerId) return;
+        const pending = room.viewerGraceTimers.get(viewerId);
+        if (pending) {
+          clearTimeout(pending);
+          room.viewerGraceTimers.delete(viewerId);
+        }
+        const existing = room.viewers.get(viewerId);
+        if (!existing && room.viewers.size >= MAX_VIEWERS) return;
+        const nickname = existing?.nickname || sanitizeNickname(msg.nickname, "Viewer");
+        room.viewers.set(viewerId, { ws, nickname });
+        ws._meta = { role: "viewer", code, viewerId, nickname };
+        sendJson(ws, { type: "reattached", code, viewerId });
+        break;
+      }
+
       case "leave_room": {
         if (ws._meta?.role === "viewer") {
-          cleanupClient(ws);
+          cleanupClient(ws, true);
         }
         break;
       }

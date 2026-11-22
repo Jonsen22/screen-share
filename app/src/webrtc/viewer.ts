@@ -31,6 +31,12 @@ export class ViewerManager {
   private pendingIce: RTCIceCandidateInit[] = [];
   private remoteSet = false;
   private statsTimer: number | null = null;
+  private reconnectTimer: number | null = null;
+  private reconnecting = false;
+  private signalingUrl = "";
+  private roomCode = "";
+  private viewerId = "";
+  private viewerNickname = "Viewer";
   private prevBytes = 0;
   private prevTimestamp = 0;
   private prevAudioBytes = 0;
@@ -44,32 +50,42 @@ export class ViewerManager {
 
   async join(signalingUrl: string, roomCode: string, nickname: string): Promise<void> {
     if (this.active) return;
+    this.signalingUrl = signalingUrl;
+    this.viewerNickname = nickname;
 
     await this.signaling.connect(signalingUrl);
 
     try {
-      const joined = await new Promise<{ code: string; hostNickname: string }>((resolve, reject) => {
-        const timer = window.setTimeout(() => {
-          unsub();
-          reject(new Error("Timed out joining room."));
-        }, 8000);
-
-        const unsub = this.signaling.onMessage((msg) => {
-          if (msg.type === "joined_room") {
-            window.clearTimeout(timer);
+      const joined = await new Promise<{ code: string; viewerId: string; hostNickname: string }>(
+        (resolve, reject) => {
+          const timer = window.setTimeout(() => {
             unsub();
-            resolve({ code: msg.code, hostNickname: msg.hostNickname || "Host" });
-          } else if (msg.type === "error") {
-            window.clearTimeout(timer);
-            unsub();
-            reject(new Error(msg.message));
-          }
-        });
+            reject(new Error("Timed out joining room."));
+          }, 8000);
 
-        this.signaling.send({ type: "join_room", code: roomCode, nickname });
-      });
+          const unsub = this.signaling.onMessage((msg) => {
+            if (msg.type === "joined_room") {
+              window.clearTimeout(timer);
+              unsub();
+              resolve({
+                code: msg.code,
+                viewerId: msg.viewerId,
+                hostNickname: msg.hostNickname || "Host",
+              });
+            } else if (msg.type === "error") {
+              window.clearTimeout(timer);
+              unsub();
+              reject(new Error(msg.message));
+            }
+          });
+
+          this.signaling.send({ type: "join_room", code: roomCode, nickname });
+        }
+      );
 
       this.active = true;
+      this.roomCode = joined.code;
+      this.viewerId = joined.viewerId;
       this.remoteStream = new MediaStream();
       this.pendingIce = [];
       this.remoteSet = false;
@@ -80,9 +96,11 @@ export class ViewerManager {
 
       this.setupPeerConnection();
       this.signaling.onMessage((msg) => this.handleServerMessage(msg));
-      this.signaling.onClose((reason) => {
+      this.signaling.onClose(() => {
         if (this.active) {
-          this.leave(reason, false);
+          // Never interrupt a live P2P WebRTC stream when signaling blips;
+          // quietly reattach signaling in the background.
+          this.scheduleSignalingReattach();
         }
       });
 
@@ -93,6 +111,46 @@ export class ViewerManager {
       this.cleanup();
       throw err;
     }
+  }
+
+  private scheduleSignalingReattach(delayMs = 3000): void {
+    if (!this.active || this.reconnecting) return;
+    this.reconnecting = true;
+
+    const attempt = async (currentDelay: number) => {
+      if (!this.active) {
+        this.reconnecting = false;
+        return;
+      }
+      try {
+        await this.signaling.connect(this.signalingUrl, 65000);
+        if (!this.active) {
+          this.signaling.close();
+          this.reconnecting = false;
+          return;
+        }
+        this.signaling.send({
+          type: "reattach_viewer",
+          code: this.roomCode,
+          viewerId: this.viewerId,
+          nickname: this.viewerNickname,
+        });
+        this.reconnecting = false;
+      } catch {
+        if (!this.active) {
+          this.reconnecting = false;
+          return;
+        }
+        const nextDelay = Math.min(currentDelay * 2, 20_000);
+        this.reconnectTimer = window.setTimeout(() => {
+          void attempt(nextDelay);
+        }, currentDelay);
+      }
+    };
+
+    this.reconnectTimer = window.setTimeout(() => {
+      void attempt(delayMs);
+    }, delayMs);
   }
 
   leave(reason?: string, notifyServer = true): void {
@@ -297,6 +355,11 @@ export class ViewerManager {
   }
 
   private cleanup(): void {
+    this.reconnecting = false;
+    if (this.reconnectTimer !== null) {
+      window.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     if (this.statsTimer !== null) {
       window.clearInterval(this.statsTimer);
       this.statsTimer = null;
@@ -308,5 +371,7 @@ export class ViewerManager {
     this.signaling.close();
     this.pendingIce = [];
     this.remoteSet = false;
+    this.roomCode = "";
+    this.viewerId = "";
   }
 }

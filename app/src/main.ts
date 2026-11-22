@@ -490,6 +490,12 @@ const hostManager = new HostManager({
     renderViewersList(viewers, maxViewers);
   },
 
+  onSignalingStatus(status) {
+    if (status === "reconnecting") {
+      hostStatusText.textContent = "Reconnecting signaling (stream still live)...";
+    }
+  },
+
   onEnded(reason) {
     isHosting = false;
     currentRoomCode = "";

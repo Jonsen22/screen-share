@@ -1,6 +1,6 @@
 [package]
 name = "screen-share"
-version = "0.1.0"
+version = "1.1.0"
 description = "Lightweight Windows desktop screen sharer with WebRTC and WASAPI per-application audio"
 authors = ["Gabriel Jansen"]
 edition = "2021"

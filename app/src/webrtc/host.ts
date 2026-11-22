@@ -1,5 +1,5 @@
 import { AppAudioBridge, AudioBridgeStatus, AudioCaptureTarget } from "../audio/app-audio";
-import { SignalingClient, ServerMessage } from "./signaling";
+import { SignalingClient, ServerMessage, signalingUrlToHealthUrl } from "./signaling";
 
 export type QualityPresetId = "720p30" | "1080p30" | "1080p60" | "source60";
 export type ContentHintMode = "motion" | "detail";
@@ -23,6 +23,8 @@ const ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun1.l.google.com:19302" },
 ];
 
+const RENDER_KEEPALIVE_MS = 10 * 60 * 1000; // 10 min (prevents 15-min Render free-tier sleep)
+
 export interface HostStartOptions {
   signalingUrl: string;
   nickname: string;
@@ -40,6 +42,7 @@ export interface HostCallbacks {
   onRoomCreated: (code: string, maxViewers: number, previewStream: MediaStream) => void;
   onStreamChanged: (previewStream: MediaStream) => void;
   onViewersChange: (viewers: ConnectedViewer[], maxViewers: number) => void;
+  onSignalingStatus?: (status: "connected" | "reconnecting") => void;
   onEnded: (reason?: string) => void;
   onError: (message: string) => void;
 }
@@ -99,8 +102,15 @@ export class HostManager {
   private peers = new Map<string, ViewerPeer>();
   private preset: PresetConfig = PRESETS["1080p30"];
   private contentHint: ContentHintMode = "motion";
+  private signalingUrl = "";
+  private hostNickname = "Host";
+  private roomCode = "";
+  private hostToken = "";
   private maxViewers = 5;
   private active = false;
+  private reconnecting = false;
+  private reconnectTimer: number | null = null;
+  private healthKeepaliveTimer: number | null = null;
   private callbacks: HostCallbacks;
 
   constructor(callbacks: HostCallbacks) {
@@ -140,6 +150,8 @@ export class HostManager {
 
     this.preset = PRESETS[options.preset];
     this.contentHint = options.contentHint;
+    this.signalingUrl = options.signalingUrl;
+    this.hostNickname = options.nickname;
 
     // Initialize AudioContext BEFORE opening the async screen picker so it stays
     // unlocked by the user's click gesture in Chromium/WebView2.
@@ -184,7 +196,7 @@ export class HostManager {
 
       await this.signaling.connect(options.signalingUrl);
 
-      const roomInfo = await new Promise<{ code: string; maxViewers: number }>(
+      const roomInfo = await new Promise<{ code: string; hostToken: string; maxViewers: number }>(
         (resolve, reject) => {
           const timer = window.setTimeout(() => {
             unsub();
@@ -195,7 +207,11 @@ export class HostManager {
             if (msg.type === "room_created") {
               window.clearTimeout(timer);
               unsub();
-              resolve({ code: msg.code, maxViewers: msg.maxViewers });
+              resolve({
+                code: msg.code,
+                hostToken: msg.hostToken || "",
+                maxViewers: msg.maxViewers,
+              });
             } else if (msg.type === "error") {
               window.clearTimeout(timer);
               unsub();
@@ -208,23 +224,90 @@ export class HostManager {
       );
 
       this.active = true;
+      this.roomCode = roomInfo.code;
+      this.hostToken = roomInfo.hostToken;
       this.maxViewers = roomInfo.maxViewers;
 
       this.signaling.onMessage((msg) => this.handleServerMessage(msg));
-      this.signaling.onClose((reason) => {
+      this.signaling.onClose(() => {
         if (this.active) {
-          void this.stop(reason);
+          // Keep live P2P streams running! Reconnect signaling in the background.
+          this.scheduleSignalingReconnect();
         }
       });
 
+      this.startHealthKeepalive();
       this.attachVideoEndedHandler(videoTrack);
 
       this.callbacks.onRoomCreated(roomInfo.code, roomInfo.maxViewers, videoStream);
+      this.callbacks.onSignalingStatus?.("connected");
       this.emitViewersChange();
     } catch (err) {
       await this.cleanup();
       throw err;
     }
+  }
+
+  private startHealthKeepalive(): void {
+    this.stopHealthKeepalive();
+    const healthUrl = signalingUrlToHealthUrl(this.signalingUrl);
+    if (!healthUrl) return;
+
+    this.healthKeepaliveTimer = window.setInterval(() => {
+      if (!this.active) return;
+      void fetch(healthUrl, { method: "GET", cache: "no-store" }).catch(() => {});
+    }, RENDER_KEEPALIVE_MS);
+  }
+
+  private stopHealthKeepalive(): void {
+    if (this.healthKeepaliveTimer !== null) {
+      window.clearInterval(this.healthKeepaliveTimer);
+      this.healthKeepaliveTimer = null;
+    }
+  }
+
+  private scheduleSignalingReconnect(delayMs = 2000): void {
+    if (!this.active || this.reconnecting) return;
+    this.reconnecting = true;
+    this.callbacks.onSignalingStatus?.("reconnecting");
+
+    const attempt = async (currentDelay: number) => {
+      if (!this.active) {
+        this.reconnecting = false;
+        return;
+      }
+      try {
+        await this.signaling.connect(this.signalingUrl, 65000);
+        if (!this.active) {
+          this.signaling.close();
+          this.reconnecting = false;
+          return;
+        }
+        if (this.hostToken) {
+          this.signaling.send({
+            type: "reclaim_room",
+            code: this.roomCode,
+            hostToken: this.hostToken,
+            nickname: this.hostNickname,
+          });
+        }
+        this.reconnecting = false;
+        this.callbacks.onSignalingStatus?.("connected");
+      } catch {
+        if (!this.active) {
+          this.reconnecting = false;
+          return;
+        }
+        const nextDelay = Math.min(currentDelay * 2, 15_000);
+        this.reconnectTimer = window.setTimeout(() => {
+          void attempt(nextDelay);
+        }, currentDelay);
+      }
+    };
+
+    this.reconnectTimer = window.setTimeout(() => {
+      void attempt(delayMs);
+    }, delayMs);
   }
 
   /**
@@ -384,6 +467,13 @@ export class HostManager {
   }
 
   private async cleanup(): Promise<void> {
+    this.reconnecting = false;
+    if (this.reconnectTimer !== null) {
+      window.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.stopHealthKeepalive();
+
     for (const peer of this.peers.values()) {
       peer.pc.close();
     }
@@ -402,6 +492,8 @@ export class HostManager {
       this.videoStream = null;
     }
     this.outboundStream = null;
+    this.roomCode = "";
+    this.hostToken = "";
   }
 
   kickViewer(viewerId: string): void {
@@ -426,13 +518,20 @@ export class HostManager {
 
   private handleServerMessage(msg: ServerMessage): void {
     switch (msg.type) {
+      case "room_reclaimed":
+        this.callbacks.onSignalingStatus?.("connected");
+        this.emitViewersChange();
+        break;
+
       case "viewer_joined":
         void this.createPeerForViewer(msg.viewerId, msg.nickname || "Viewer");
         break;
 
       case "viewer_left":
-        this.removePeer(msg.viewerId);
-        this.emitViewersChange();
+        if (msg.explicit || msg.kicked) {
+          this.removePeer(msg.viewerId);
+          this.emitViewersChange();
+        }
         break;
 
       case "signal":

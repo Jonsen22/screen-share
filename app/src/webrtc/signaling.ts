@@ -4,7 +4,9 @@ export type SignalPayload =
   | { kind: "ice"; candidate: RTCIceCandidateInit };
 
 export type ServerMessage =
-  | { type: "room_created"; code: string; maxViewers: number }
+  | { type: "pong" }
+  | { type: "room_created"; code: string; hostToken?: string; maxViewers: number }
+  | { type: "room_reclaimed"; code: string; maxViewers: number; viewerCount: number }
   | {
       type: "joined_room";
       code: string;
@@ -13,6 +15,7 @@ export type ServerMessage =
       viewerCount: number;
       maxViewers: number;
     }
+  | { type: "reattached"; code: string; viewerId: string }
   | { type: "viewer_joined"; viewerId: string; nickname?: string; viewerCount: number }
   | {
       type: "viewer_left";
@@ -20,6 +23,7 @@ export type ServerMessage =
       nickname?: string;
       viewerCount: number;
       kicked?: boolean;
+      explicit?: boolean;
     }
   | { type: "kicked"; reason: string }
   | { type: "room_closed"; reason: string }
@@ -37,14 +41,30 @@ export function normalizeSignalingUrl(raw: string): string {
   return trimmed;
 }
 
+export function signalingUrlToHealthUrl(raw: string): string | null {
+  const wsUrl = normalizeSignalingUrl(raw);
+  if (wsUrl.startsWith("wss://")) {
+    return "https://" + wsUrl.slice("wss://".length) + "/health";
+  }
+  if (wsUrl.startsWith("ws://")) {
+    return "http://" + wsUrl.slice("ws://".length) + "/health";
+  }
+  return null;
+}
+
 export class SignalingClient {
   private ws: WebSocket | null = null;
   private listeners = new Set<(msg: ServerMessage) => void>();
   private closeListeners = new Set<(reason: string) => void>();
+  private pingTimer: number | null = null;
   private intentionalClose = false;
 
+  isConnected(): boolean {
+    return this.ws !== null && this.ws.readyState === WebSocket.OPEN;
+  }
+
   async connect(rawUrl: string, timeoutMs = 65000): Promise<void> {
-    this.close();
+    this.closeSocketOnly();
     this.intentionalClose = false;
     const url = normalizeSignalingUrl(rawUrl);
 
@@ -71,6 +91,7 @@ export class SignalingClient {
         settled = true;
         window.clearTimeout(timer);
         this.ws = socket;
+        this.startKeepalive();
         resolve();
       };
 
@@ -85,6 +106,7 @@ export class SignalingClient {
       socket.onmessage = (event) => {
         try {
           const parsed = JSON.parse(String(event.data)) as ServerMessage;
+          if (parsed.type === "pong") return;
           for (const listener of this.listeners) {
             listener(parsed);
           }
@@ -96,6 +118,7 @@ export class SignalingClient {
       socket.onclose = () => {
         if (this.ws === socket) {
           this.ws = null;
+          this.stopKeepalive();
         }
         if (!this.intentionalClose && settled) {
           for (const listener of this.closeListeners) {
@@ -125,15 +148,44 @@ export class SignalingClient {
 
   close(): void {
     this.intentionalClose = true;
+    this.closeSocketOnly();
+    this.listeners.clear();
+    this.closeListeners.clear();
+  }
+
+  private closeSocketOnly(): void {
+    this.stopKeepalive();
     if (this.ws) {
+      const old = this.ws;
+      this.ws = null;
+      old.onclose = null;
+      old.onerror = null;
+      old.onmessage = null;
       try {
-        this.ws.close();
+        old.close();
       } catch {
         // Ignore
       }
-      this.ws = null;
     }
-    this.listeners.clear();
-    this.closeListeners.clear();
+  }
+
+  private startKeepalive(): void {
+    this.stopKeepalive();
+    this.pingTimer = window.setInterval(() => {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        try {
+          this.ws.send(JSON.stringify({ type: "ping" }));
+        } catch {
+          // Ignore
+        }
+      }
+    }, 20_000);
+  }
+
+  private stopKeepalive(): void {
+    if (this.pingTimer !== null) {
+      window.clearInterval(this.pingTimer);
+      this.pingTimer = null;
+    }
   }
 }
