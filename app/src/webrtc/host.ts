@@ -1,4 +1,4 @@
-import { AppAudioBridge, AudioBridgeStatus } from "../audio/app-audio";
+import { AppAudioBridge, AudioBridgeStatus, AudioCaptureTarget } from "../audio/app-audio";
 import { SignalingClient, ServerMessage } from "./signaling";
 
 export type QualityPresetId = "720p30" | "1080p30" | "1080p60" | "source60";
@@ -28,7 +28,7 @@ export interface HostStartOptions {
   nickname: string;
   preset: QualityPresetId;
   contentHint: ContentHintMode;
-  audioPid: number | null;
+  audioTarget: AudioCaptureTarget;
 }
 
 export interface ConnectedViewer {
@@ -176,8 +176,8 @@ export class HostManager {
 
     try {
       await this.audioBridge.ensureRunning();
-      if (options.audioPid !== null) {
-        await this.audioBridge.setTargetPid(options.audioPid);
+      if (options.audioTarget.kind !== "none") {
+        await this.audioBridge.setTarget(options.audioTarget);
       }
 
       this.outboundStream = new MediaStream([videoTrack, audioTrack]);
@@ -329,9 +329,9 @@ export class HostManager {
     await Promise.all(tasks);
   }
 
-  async switchAudioApp(pid: number | null): Promise<void> {
+  async switchAudioTarget(target: AudioCaptureTarget): Promise<void> {
     if (!this.active) return;
-    await this.audioBridge.setTargetPid(pid);
+    await this.audioBridge.setTarget(target);
   }
 
   setAudioMuted(muted: boolean): void {

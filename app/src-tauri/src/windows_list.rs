@@ -10,6 +10,85 @@ pub struct AudioAppInfo {
     pub is_playing_audio: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscordProcessInfo {
+    pub pid: u32,
+    pub process_name: String,
+}
+
+#[cfg(windows)]
+pub fn find_discord_root_process() -> Option<DiscordProcessInfo> {
+    use std::collections::HashSet;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    const DISCORD_NAMES: &[&str] = &["discord", "discordptb", "discordcanary", "vesktop"];
+
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+
+        let mut matches: Vec<(u32, u32, String)> = Vec::new();
+
+        if Process32FirstW(snapshot, &mut entry).is_ok() {
+            loop {
+                let len = entry
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let exe = String::from_utf16_lossy(&entry.szExeFile[..len]);
+                let stem = exe
+                    .strip_suffix(".exe")
+                    .or_else(|| exe.strip_suffix(".EXE"))
+                    .unwrap_or(&exe);
+                let lower = stem.to_ascii_lowercase();
+                if DISCORD_NAMES.contains(&lower.as_str()) {
+                    matches.push((
+                        entry.th32ProcessID,
+                        entry.th32ParentProcessID,
+                        stem.to_string(),
+                    ));
+                }
+                if Process32NextW(snapshot, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snapshot);
+
+        if matches.is_empty() {
+            return None;
+        }
+
+        // Find the top-most root process whose parent is NOT another Discord process,
+        // so PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE excludes the entire
+        // Discord process tree (including its audio/voice utility subprocess).
+        let matching_pids: HashSet<u32> = matches.iter().map(|(pid, _, _)| *pid).collect();
+        let chosen = matches
+            .iter()
+            .find(|(_, parent_pid, _)| !matching_pids.contains(parent_pid))
+            .or_else(|| matches.first())?;
+
+        Some(DiscordProcessInfo {
+            pid: chosen.0,
+            process_name: chosen.2.clone(),
+        })
+    }
+}
+
+#[cfg(not(windows))]
+pub fn find_discord_root_process() -> Option<DiscordProcessInfo> {
+    None
+}
+
 #[cfg(windows)]
 pub fn enumerate_audio_apps() -> Result<Vec<AudioAppInfo>, String> {
     use std::collections::HashMap;

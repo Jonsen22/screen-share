@@ -1,4 +1,11 @@
-import { AudioAppInfo, isTauriRuntime, listAudioApps } from "./audio/app-audio";
+import {
+  AudioAppInfo,
+  AudioCaptureTarget,
+  DiscordProcessInfo,
+  findDiscordApp,
+  isTauriRuntime,
+  listAudioApps,
+} from "./audio/app-audio";
 import { checkForAppUpdate, getCurrentAppVersion } from "./version-check";
 import { ConnectedViewer, ContentHintMode, HostManager, QualityPresetId } from "./webrtc/host";
 import { normalizeSignalingUrl } from "./webrtc/signaling";
@@ -53,6 +60,8 @@ const livePresetSelect = el<HTMLSelectElement>("live-preset-select");
 const liveHintSelect = el<HTMLSelectElement>("live-hint-select");
 const audioAppSelect = el<HTMLSelectElement>("audio-app-select");
 const liveAudioAppSelect = el<HTMLSelectElement>("live-audio-app-select");
+const audioAppHint = el<HTMLElement>("audio-app-hint");
+const liveAudioAppHint = el<HTMLElement>("live-audio-app-hint");
 const btnRefreshApps = el<HTMLButtonElement>("btn-refresh-apps");
 const btnLiveRefreshApps = el<HTMLButtonElement>("btn-live-refresh-apps");
 const btnStartShare = el<HTMLButtonElement>("btn-start-share");
@@ -273,28 +282,75 @@ function setTabsLocked(locked: boolean): void {
 tabHost.addEventListener("click", () => setMode("host"));
 tabViewer.addEventListener("click", () => setMode("viewer"));
 
+let detectedDiscord: DiscordProcessInfo | null = null;
+
+function parseAudioTarget(value: string): AudioCaptureTarget {
+  if (!value) return { kind: "none" };
+  if (value === "exclude-discord") return { kind: "exclude_discord" };
+  const pid = Number(value);
+  return Number.isFinite(pid) && pid > 0 ? { kind: "include_pid", pid } : { kind: "none" };
+}
+
+function updateAudioHint(select: HTMLSelectElement, hintEl: HTMLElement): void {
+  const val = select.value;
+  if (val === "exclude-discord") {
+    if (detectedDiscord) {
+      hintEl.textContent = `Captures all PC audio (games, browser, music, etc.) while excluding ${detectedDiscord.processName} so watchers don't hear themselves or voice-call echo.`;
+    } else {
+      hintEl.textContent =
+        "Captures all PC audio while excluding Discord so watchers don't hear themselves. (Discord isn't running right now — if you open it later, click Refresh and re-select this option.)";
+    }
+  } else if (val) {
+    hintEl.textContent =
+      "Only captures audio from the selected application and its child processes — never system notifications or voice chat.";
+  } else {
+    hintEl.textContent =
+      'Video only — no audio sent. Choose "All PC Audio (Exclude Discord)" to share all PC sound without watchers hearing themselves, or pick a single app.';
+  }
+}
+
 // Populate Windows application audio dropdowns
-function populateAppSelect(select: HTMLSelectElement, apps: AudioAppInfo[], preserveValue: string): void {
+function populateAppSelect(
+  select: HTMLSelectElement,
+  apps: AudioAppInfo[],
+  discord: DiscordProcessInfo | null,
+  preserveValue: string
+): void {
   select.innerHTML = "";
+
   const noneOpt = document.createElement("option");
   noneOpt.value = "";
   noneOpt.textContent = "No Audio (Video Only)";
   select.appendChild(noneOpt);
 
-  for (const app of apps) {
-    const opt = document.createElement("option");
-    opt.value = String(app.pid);
-    const badge = app.isPlayingAudio
-      ? "[Playing] "
-      : app.hasAudioSession
-        ? "[Audio] "
-        : "";
-    const title =
-      app.windowTitle.length > 46
-        ? `${app.windowTitle.slice(0, 43)}...`
-        : app.windowTitle;
-    opt.textContent = `${badge}${app.processName} — ${title} (PID ${app.pid})`;
-    select.appendChild(opt);
+  const excludeDiscordOpt = document.createElement("option");
+  excludeDiscordOpt.value = "exclude-discord";
+  excludeDiscordOpt.textContent = discord
+    ? `All PC Audio (Exclude ${discord.processName} — no voice echo)`
+    : "All PC Audio (Exclude Discord — not running)";
+  select.appendChild(excludeDiscordOpt);
+
+  if (apps.length > 0) {
+    const group = document.createElement("optgroup");
+    group.label = "Single Application Only";
+
+    for (const app of apps) {
+      const opt = document.createElement("option");
+      opt.value = String(app.pid);
+      const badge = app.isPlayingAudio
+        ? "[Playing] "
+        : app.hasAudioSession
+          ? "[Audio] "
+          : "";
+      const title =
+        app.windowTitle.length > 46
+          ? `${app.windowTitle.slice(0, 43)}...`
+          : app.windowTitle;
+      opt.textContent = `${badge}${app.processName} — ${title} (PID ${app.pid})`;
+      group.appendChild(opt);
+    }
+
+    select.appendChild(group);
   }
 
   if (preserveValue && Array.from(select.options).some((o) => o.value === preserveValue)) {
@@ -306,14 +362,18 @@ function populateAppSelect(select: HTMLSelectElement, apps: AudioAppInfo[], pres
 
 async function refreshAudioApps(): Promise<void> {
   try {
-    const apps = await listAudioApps();
-    populateAppSelect(audioAppSelect, apps, audioAppSelect.value);
-    populateAppSelect(liveAudioAppSelect, apps, liveAudioAppSelect.value);
+    const [apps, discord] = await Promise.all([listAudioApps(), findDiscordApp()]);
+    detectedDiscord = discord;
+    populateAppSelect(audioAppSelect, apps, discord, audioAppSelect.value);
+    populateAppSelect(liveAudioAppSelect, apps, discord, liveAudioAppSelect.value);
+    updateAudioHint(audioAppSelect, audioAppHint);
+    updateAudioHint(liveAudioAppSelect, liveAudioAppHint);
   } catch (err) {
     showAlert(hostError, `Could not enumerate Windows apps: ${String(err)}`);
   }
 }
 
+audioAppSelect.addEventListener("change", () => updateAudioHint(audioAppSelect, audioAppHint));
 btnRefreshApps.addEventListener("click", () => void refreshAudioApps());
 btnLiveRefreshApps.addEventListener("click", () => void refreshAudioApps());
 
@@ -409,6 +469,7 @@ const hostManager = new HostManager({
     livePresetSelect.value = presetSelect.value;
     liveHintSelect.value = hintSelect.value;
     liveAudioAppSelect.value = audioAppSelect.value;
+    updateAudioHint(liveAudioAppSelect, liveAudioAppHint);
     btnHostMute.textContent = "Mute Audio";
     btnHostMute.classList.remove("btn-active");
     btnHostMonitor.textContent = "Test Sound";
@@ -462,14 +523,14 @@ btnStartShare.addEventListener("click", async () => {
   btnStartShare.disabled = true;
   btnStartShare.textContent = "Starting...";
 
-  const selectedPid = audioAppSelect.value ? Number(audioAppSelect.value) : null;
+  const audioTarget = parseAudioTarget(audioAppSelect.value);
   try {
     await hostManager.start({
       signalingUrl: getSignalingUrl(),
       nickname: currentNickname,
       preset: presetSelect.value as QualityPresetId,
       contentHint: hintSelect.value as ContentHintMode,
-      audioPid: selectedPid,
+      audioTarget,
     });
   } catch (err) {
     btnStartShare.disabled = false;
@@ -528,9 +589,10 @@ btnCopyCode.addEventListener("click", async () => {
 
 liveAudioAppSelect.addEventListener("change", async () => {
   showAlert(hostLiveError, null);
-  const pid = liveAudioAppSelect.value ? Number(liveAudioAppSelect.value) : null;
+  updateAudioHint(liveAudioAppSelect, liveAudioAppHint);
+  const target = parseAudioTarget(liveAudioAppSelect.value);
   try {
-    await hostManager.switchAudioApp(pid);
+    await hostManager.switchAudioTarget(target);
   } catch (err) {
     showAlert(hostLiveError, err instanceof Error ? err.message : String(err));
   }

@@ -125,9 +125,10 @@
               </div>
               <select id="audio-app-select">
                 <option value="">No Audio (Video Only)</option>
+                <option value="exclude-discord">All PC Audio (Exclude Discord)</option>
               </select>
-              <p class="field-hint">
-                Only captures audio from the selected application and its child processes — never system notifications or voice chat.
+              <p id="audio-app-hint" class="field-hint">
+                Pick "All PC Audio (Exclude Discord)" to share all PC sound without watchers hearing themselves, or pick a single application.
               </p>
             </div>
 
@@ -201,7 +202,11 @@
                 </div>
                 <select id="live-audio-app-select">
                   <option value="">No Audio (Video Only)</option>
+                  <option value="exclude-discord">All PC Audio (Exclude Discord)</option>
                 </select>
+                <p id="live-audio-app-hint" class="field-hint">
+                  Pick "All PC Audio (Exclude Discord)" to share all PC sound without watchers hearing themselves, or pick a single app.
+                </p>
               </div>
 
               <div class="meter-block">

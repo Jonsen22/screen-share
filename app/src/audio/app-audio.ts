@@ -8,6 +8,16 @@ export interface AudioAppInfo {
   isPlayingAudio: boolean;
 }
 
+export interface DiscordProcessInfo {
+  pid: number;
+  processName: string;
+}
+
+export type AudioCaptureTarget =
+  | { kind: "none" }
+  | { kind: "include_pid"; pid: number }
+  | { kind: "exclude_discord" };
+
 export interface AudioBridgeStatus {
   state: "off" | "suspended" | "waiting" | "capturing";
   label: string;
@@ -23,6 +33,13 @@ export async function listAudioApps(): Promise<AudioAppInfo[]> {
     return [];
   }
   return invoke<AudioAppInfo[]>("list_audio_apps");
+}
+
+export async function findDiscordApp(): Promise<DiscordProcessInfo | null> {
+  if (!isTauriRuntime()) {
+    return null;
+  }
+  return invoke<DiscordProcessInfo | null>("find_discord_app");
 }
 
 function toArrayBuffer(chunk: ArrayBuffer | Uint8Array | number[]): ArrayBuffer | null {
@@ -56,7 +73,7 @@ export class AppAudioBridge {
   private monitorGain: GainNode | null = null;
   private destination: MediaStreamAudioDestinationNode | null = null;
   private meterBuffer: Float32Array<ArrayBuffer> | null = null;
-  private activePid: number | null = null;
+  private activeTarget: AudioCaptureTarget = { kind: "none" };
   private muted = false;
   private monitoringLocally = false;
   private chunksReceived = 0;
@@ -123,23 +140,31 @@ export class AppAudioBridge {
     }
   }
 
-  async setTargetPid(pid: number | null): Promise<void> {
-    if (this.activePid === pid) return;
+  private isSameTarget(a: AudioCaptureTarget, b: AudioCaptureTarget): boolean {
+    if (a.kind !== b.kind) return false;
+    if (a.kind === "include_pid" && b.kind === "include_pid") {
+      return a.pid === b.pid;
+    }
+    return true;
+  }
+
+  async setTarget(target: AudioCaptureTarget): Promise<void> {
+    if (this.isSameTarget(this.activeTarget, target)) return;
 
     if (isTauriRuntime()) {
       await invoke("stop_app_audio").catch(() => {});
     }
     this.worklet?.port.postMessage({ type: "clear" });
-    this.activePid = null;
+    this.activeTarget = { kind: "none" };
     this.chunksReceived = 0;
     this.lastChunkAt = 0;
 
-    if (pid === null) {
+    if (target.kind === "none") {
       return;
     }
 
     if (!isTauriRuntime()) {
-      throw new Error("Per-application WASAPI audio capture requires the Tauri desktop app.");
+      throw new Error("Windows WASAPI audio capture requires the Tauri desktop app.");
     }
 
     if (!this.worklet) {
@@ -158,8 +183,12 @@ export class AppAudioBridge {
       }
     };
 
-    await invoke("start_app_audio", { pid, onAudio: channel });
-    this.activePid = pid;
+    if (target.kind === "exclude_discord") {
+      await invoke("start_app_audio", { pid: null, exclude: true, onAudio: channel });
+    } else {
+      await invoke("start_app_audio", { pid: target.pid, exclude: false, onAudio: channel });
+    }
+    this.activeTarget = target;
   }
 
   setMuted(muted: boolean): void {
@@ -184,7 +213,7 @@ export class AppAudioBridge {
   }
 
   getStatus(): AudioBridgeStatus {
-    if (this.activePid === null) {
+    if (this.activeTarget.kind === "none") {
       return { state: "off", label: "Audio off", chunksReceived: 0 };
     }
     if (this.ctx && this.ctx.state !== "running") {
@@ -194,24 +223,30 @@ export class AppAudioBridge {
         chunksReceived: this.chunksReceived,
       };
     }
+    const isExcludeDiscord = this.activeTarget.kind === "exclude_discord";
     const recentlyActive = this.lastChunkAt > 0 && performance.now() - this.lastChunkAt < 1200;
     if (recentlyActive) {
+      const modeLabel = isExcludeDiscord
+        ? "All PC (Discord excluded) · 48 kHz"
+        : "Capturing · 48 kHz stereo";
       return {
         state: "capturing",
-        label: this.muted ? "Capturing (muted)" : "Capturing · 48 kHz stereo",
+        label: this.muted ? "Capturing (muted)" : modeLabel,
         chunksReceived: this.chunksReceived,
       };
     }
     return {
       state: "waiting",
-      label: "Connected — waiting for app sound...",
+      label: isExcludeDiscord
+        ? "Connected — waiting for PC sound..."
+        : "Connected — waiting for app sound...",
       chunksReceived: this.chunksReceived,
     };
   }
 
   /** Returns normalized RMS audio level [0..1] for the host UI meter. */
   getLevel(): number {
-    if (!this.analyser || !this.meterBuffer || this.muted || this.activePid === null) {
+    if (!this.analyser || !this.meterBuffer || this.muted || this.activeTarget.kind === "none") {
       return 0;
     }
     this.analyser.getFloatTimeDomainData(this.meterBuffer);
@@ -228,7 +263,7 @@ export class AppAudioBridge {
     if (isTauriRuntime()) {
       await invoke("stop_app_audio").catch(() => {});
     }
-    this.activePid = null;
+    this.activeTarget = { kind: "none" };
     this.monitoringLocally = false;
     this.chunksReceived = 0;
     this.lastChunkAt = 0;
