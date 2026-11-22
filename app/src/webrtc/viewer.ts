@@ -17,7 +17,7 @@ export interface ViewerStats {
 }
 
 export interface ViewerCallbacks {
-  onJoined: (code: string) => void;
+  onJoined: (code: string, hostNickname: string) => void;
   onStream: (stream: MediaStream) => void;
   onBanner: (text: string | null) => void;
   onStats: (stats: ViewerStats) => void;
@@ -42,13 +42,13 @@ export class ViewerManager {
     this.callbacks = callbacks;
   }
 
-  async join(signalingUrl: string, roomCode: string): Promise<void> {
+  async join(signalingUrl: string, roomCode: string, nickname: string): Promise<void> {
     if (this.active) return;
 
     await this.signaling.connect(signalingUrl);
 
     try {
-      const joined = await new Promise<{ code: string }>((resolve, reject) => {
+      const joined = await new Promise<{ code: string; hostNickname: string }>((resolve, reject) => {
         const timer = window.setTimeout(() => {
           unsub();
           reject(new Error("Timed out joining room."));
@@ -58,7 +58,7 @@ export class ViewerManager {
           if (msg.type === "joined_room") {
             window.clearTimeout(timer);
             unsub();
-            resolve({ code: msg.code });
+            resolve({ code: msg.code, hostNickname: msg.hostNickname || "Host" });
           } else if (msg.type === "error") {
             window.clearTimeout(timer);
             unsub();
@@ -66,7 +66,7 @@ export class ViewerManager {
           }
         });
 
-        this.signaling.send({ type: "join_room", code: roomCode });
+        this.signaling.send({ type: "join_room", code: roomCode, nickname });
       });
 
       this.active = true;
@@ -82,11 +82,11 @@ export class ViewerManager {
       this.signaling.onMessage((msg) => this.handleServerMessage(msg));
       this.signaling.onClose((reason) => {
         if (this.active) {
-          this.leave(reason);
+          this.leave(reason, false);
         }
       });
 
-      this.callbacks.onJoined(joined.code);
+      this.callbacks.onJoined(joined.code, joined.hostNickname);
       this.callbacks.onBanner("Connecting to host...");
       this.startStatsLoop();
     } catch (err) {
@@ -95,13 +95,15 @@ export class ViewerManager {
     }
   }
 
-  leave(reason?: string): void {
+  leave(reason?: string, notifyServer = true): void {
     if (!this.active) return;
     this.active = false;
-    try {
-      this.signaling.send({ type: "leave_room" });
-    } catch {
-      // Ignore
+    if (notifyServer) {
+      try {
+        this.signaling.send({ type: "leave_room" });
+      } catch {
+        // Ignore
+      }
     }
     this.cleanup();
     this.callbacks.onEnded(reason);
@@ -152,11 +154,14 @@ export class ViewerManager {
       case "signal":
         void this.handleSignal(msg.payload);
         break;
+      case "kicked":
+        this.leave(msg.reason || "You were removed from the room by the host.", false);
+        break;
       case "room_closed":
-        this.leave(msg.reason || "Host ended the stream.");
+        this.leave(msg.reason || "Host ended the stream.", false);
         break;
       case "error":
-        this.leave(msg.message);
+        this.leave(msg.message, false);
         break;
     }
   }

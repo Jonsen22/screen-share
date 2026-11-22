@@ -1,10 +1,16 @@
 import { AudioAppInfo, isTauriRuntime, listAudioApps } from "./audio/app-audio";
-import { ContentHintMode, HostManager, QualityPresetId } from "./webrtc/host";
+import { ConnectedViewer, ContentHintMode, HostManager, QualityPresetId } from "./webrtc/host";
 import { normalizeSignalingUrl } from "./webrtc/signaling";
 import { ViewerManager } from "./webrtc/viewer";
 
-const SIGNALING_STORAGE_KEY = "screen-share.signaling-url";
-const DEFAULT_SIGNALING_URL = "wss://screen-share-wfrh.onrender.com";
+const SIGNALING_STORAGE_KEY = import.meta.env.DEV
+  ? "screen-share.signaling-url.dev"
+  : "screen-share.signaling-url";
+const NICKNAME_STORAGE_KEY = "screen-share.nickname";
+const DEFAULT_SIGNALING_URL =
+  normalizeSignalingUrl(import.meta.env.VITE_SIGNALING_URL ?? "") ||
+  "wss://screen-share-wfrh.onrender.com";
+const MAX_NICKNAME_LEN = 24;
 
 function el<T extends HTMLElement>(id: string): T {
   const node = document.getElementById(id);
@@ -12,12 +18,20 @@ function el<T extends HTMLElement>(id: string): T {
   return node as T;
 }
 
-// Navigation & Server Config
+// Navigation, Server Config & Nickname
 const tabHost = el<HTMLButtonElement>("tab-host");
 const tabViewer = el<HTMLButtonElement>("tab-viewer");
 const viewHost = el<HTMLElement>("view-host");
 const viewViewer = el<HTMLElement>("view-viewer");
 const signalingInput = el<HTMLInputElement>("signaling-url");
+const btnEditNickname = el<HTMLButtonElement>("btn-edit-nickname");
+const nicknameDisplay = el<HTMLElement>("nickname-display");
+const nicknameModal = el<HTMLElement>("nickname-modal");
+const nicknameModalTitle = el<HTMLElement>("nickname-modal-title");
+const nicknameForm = el<HTMLFormElement>("nickname-form");
+const nicknameInput = el<HTMLInputElement>("nickname-input");
+const nicknameError = el<HTMLElement>("nickname-error");
+const btnNicknameCancel = el<HTMLButtonElement>("btn-nickname-cancel");
 
 // Host elements
 const hostSetup = el<HTMLElement>("host-setup");
@@ -40,6 +54,8 @@ const hostPreview = el<HTMLVideoElement>("host-preview");
 const hostRoomCode = el<HTMLElement>("host-room-code");
 const hostVideoMeta = el<HTMLElement>("host-video-meta");
 const hostViewerPill = el<HTMLElement>("host-viewer-pill");
+const hostViewersCount = el<HTMLElement>("host-viewers-count");
+const hostViewersList = el<HTMLUListElement>("host-viewers-list");
 const hostStatusText = el<HTMLElement>("host-status-text");
 const hostAudioStatus = el<HTMLElement>("host-audio-status");
 const hostAudioMeter = el<HTMLElement>("host-audio-meter");
@@ -80,13 +96,70 @@ let isHosting = false;
 let isWatching = false;
 let meterRafId: number | null = null;
 let currentRoomCode = "";
+let currentNickname = "";
+let nicknameModalRequired = false;
+
+function sanitizeNickname(raw: string): string {
+  return raw
+    .replace(/[\u0000-\u001F\u007F]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, MAX_NICKNAME_LEN);
+}
+
+function setNickname(name: string): void {
+  currentNickname = name;
+  nicknameDisplay.textContent = name || "Set nickname";
+  if (name) {
+    window.localStorage.setItem(NICKNAME_STORAGE_KEY, name);
+  }
+}
+
+function openNicknameModal(required: boolean): void {
+  if (!required && (isHosting || isWatching)) return;
+  nicknameModalRequired = required;
+  nicknameModalTitle.textContent = required ? "Choose a Nickname" : "Change Nickname";
+  btnNicknameCancel.classList.toggle("hidden", required);
+  showAlert(nicknameError, null);
+  nicknameInput.value = currentNickname;
+  nicknameModal.classList.remove("hidden");
+  window.requestAnimationFrame(() => {
+    nicknameInput.focus();
+    nicknameInput.select();
+  });
+}
+
+function closeNicknameModal(): void {
+  if (nicknameModalRequired && !currentNickname) return;
+  nicknameModal.classList.add("hidden");
+  showAlert(nicknameError, null);
+}
+
+btnEditNickname.addEventListener("click", () => openNicknameModal(false));
+btnNicknameCancel.addEventListener("click", () => closeNicknameModal());
+nicknameModal.addEventListener("click", (e) => {
+  if (e.target === nicknameModal && !nicknameModalRequired) {
+    closeNicknameModal();
+  }
+});
+
+nicknameForm.addEventListener("submit", (e) => {
+  e.preventDefault();
+  const cleaned = sanitizeNickname(nicknameInput.value);
+  if (!cleaned) {
+    showAlert(nicknameError, "Please enter a nickname (1–24 characters).");
+    nicknameInput.focus();
+    return;
+  }
+  setNickname(cleaned);
+  nicknameModalRequired = false;
+  closeNicknameModal();
+});
 
 // Initialize persisted signaling URL
 const savedUrl = window.localStorage.getItem(SIGNALING_STORAGE_KEY);
-signalingInput.value =
-  savedUrl && savedUrl !== "ws://localhost:8787"
-    ? normalizeSignalingUrl(savedUrl)
-    : DEFAULT_SIGNALING_URL;
+signalingInput.placeholder = DEFAULT_SIGNALING_URL;
+signalingInput.value = savedUrl ? normalizeSignalingUrl(savedUrl) : DEFAULT_SIGNALING_URL;
 signalingInput.addEventListener("change", () => {
   const val = normalizeSignalingUrl(signalingInput.value) || DEFAULT_SIGNALING_URL;
   signalingInput.value = val;
@@ -125,6 +198,10 @@ function setTabsLocked(locked: boolean): void {
   tabHost.disabled = locked;
   tabViewer.disabled = locked;
   signalingInput.disabled = locked;
+  btnEditNickname.disabled = locked;
+  btnEditNickname.title = locked
+    ? "Leave the active room to change your nickname"
+    : "Change your nickname";
 }
 
 tabHost.addEventListener("click", () => setMode("host"));
@@ -209,6 +286,48 @@ function attachHostPreview(previewStream: MediaStream): void {
   hostVideoMeta.textContent = hostManager.getVideoMeta();
 }
 
+function renderViewersList(viewers: ConnectedViewer[], maxViewers: number): void {
+  const count = viewers.length;
+  hostViewerPill.textContent = `${count} / ${maxViewers} Viewers`;
+  hostViewersCount.textContent = `${count} / ${maxViewers}`;
+  hostStatusText.textContent =
+    count === 0
+      ? "Waiting for viewers to join..."
+      : `${count} ${count === 1 ? "viewer" : "viewers"} watching live.`;
+
+  hostViewersList.innerHTML = "";
+  if (count === 0) {
+    const empty = document.createElement("li");
+    empty.className = "viewers-empty";
+    empty.textContent = "No viewers connected yet.";
+    hostViewersList.appendChild(empty);
+    return;
+  }
+
+  for (const viewer of viewers) {
+    const li = document.createElement("li");
+    li.className = "viewer-row";
+
+    const nameSpan = document.createElement("span");
+    nameSpan.className = "viewer-name";
+    nameSpan.textContent = viewer.nickname;
+    nameSpan.title = viewer.nickname;
+
+    const kickBtn = document.createElement("button");
+    kickBtn.type = "button";
+    kickBtn.className = "btn btn-kick";
+    kickBtn.textContent = "Kick";
+    kickBtn.title = `Kick ${viewer.nickname} from the room`;
+    kickBtn.addEventListener("click", () => {
+      hostManager.kickViewer(viewer.id);
+    });
+
+    li.appendChild(nameSpan);
+    li.appendChild(kickBtn);
+    hostViewersList.appendChild(li);
+  }
+}
+
 // Host Manager
 const hostManager = new HostManager({
   onRoomCreated(code, maxViewers, previewStream) {
@@ -219,7 +338,7 @@ const hostManager = new HostManager({
     showAlert(hostLiveError, null);
 
     hostRoomCode.textContent = code;
-    hostViewerPill.textContent = `0 / ${maxViewers} Viewers`;
+    renderViewersList([], maxViewers);
     hostStatusText.textContent = "Share this code with up to 5 viewers.";
     livePresetSelect.value = presetSelect.value;
     liveHintSelect.value = hintSelect.value;
@@ -240,12 +359,8 @@ const hostManager = new HostManager({
     attachHostPreview(previewStream);
   },
 
-  onViewerCountChange(count, maxViewers) {
-    hostViewerPill.textContent = `${count} / ${maxViewers} Viewers`;
-    hostStatusText.textContent =
-      count === 0
-        ? "Waiting for viewers to join..."
-        : `${count} ${count === 1 ? "viewer" : "viewers"} watching live.`;
+  onViewersChange(viewers, maxViewers) {
+    renderViewersList(viewers, maxViewers);
   },
 
   onEnded(reason) {
@@ -273,6 +388,10 @@ const hostManager = new HostManager({
 });
 
 btnStartShare.addEventListener("click", async () => {
+  if (!currentNickname) {
+    openNicknameModal(true);
+    return;
+  }
   showAlert(hostError, null);
   btnStartShare.disabled = true;
   btnStartShare.textContent = "Starting...";
@@ -281,6 +400,7 @@ btnStartShare.addEventListener("click", async () => {
   try {
     await hostManager.start({
       signalingUrl: getSignalingUrl(),
+      nickname: currentNickname,
       preset: presetSelect.value as QualityPresetId,
       contentHint: hintSelect.value as ContentHintMode,
       audioPid: selectedPid,
@@ -366,12 +486,12 @@ btnHostMute.addEventListener("click", () => {
 
 // Viewer Manager
 const viewerManager = new ViewerManager({
-  onJoined(code) {
+  onJoined(code, hostNickname) {
     isWatching = true;
     setTabsLocked(true);
     showAlert(viewerError, null);
     btnUnmuteOverlay.classList.add("hidden");
-    viewerRoomBadge.textContent = `Room ${code}`;
+    viewerRoomBadge.textContent = `Room ${code} · ${hostNickname}`;
     viewerJoin.classList.add("hidden");
     viewerStage.classList.remove("hidden");
   },
@@ -451,6 +571,10 @@ roomCodeInput.addEventListener("input", () => {
 
 viewerJoinForm.addEventListener("submit", async (e) => {
   e.preventDefault();
+  if (!currentNickname) {
+    openNicknameModal(true);
+    return;
+  }
   showAlert(viewerError, null);
 
   const code = roomCodeInput.value.trim();
@@ -463,7 +587,7 @@ viewerJoinForm.addEventListener("submit", async (e) => {
   btnJoinRoom.textContent = "Connecting...";
 
   try {
-    await viewerManager.join(getSignalingUrl(), code);
+    await viewerManager.join(getSignalingUrl(), code, currentNickname);
   } catch (err) {
     btnJoinRoom.disabled = false;
     btnJoinRoom.textContent = "Join Stream";
@@ -510,6 +634,12 @@ btnFullscreen.addEventListener("click", () => void toggleFullscreen());
 viewerVideo.addEventListener("dblclick", () => void toggleFullscreen());
 
 window.addEventListener("keydown", (e) => {
+  if (!nicknameModal.classList.contains("hidden")) {
+    if (e.key === "Escape" && !nicknameModalRequired) {
+      closeNicknameModal();
+    }
+    return;
+  }
   if (!isWatching || activeMode !== "viewer") return;
   if (e.key === "i" || e.key === "I") {
     toggleStats();
@@ -517,6 +647,14 @@ window.addEventListener("keydown", (e) => {
     void toggleFullscreen();
   }
 });
+
+// Initialize persisted nickname (prompt on first launch)
+const savedNickname = sanitizeNickname(window.localStorage.getItem(NICKNAME_STORAGE_KEY) ?? "");
+if (savedNickname) {
+  setNickname(savedNickname);
+} else {
+  openNicknameModal(true);
+}
 
 // Initial app enumeration (in Tauri desktop runtime)
 if (isTauriRuntime()) {

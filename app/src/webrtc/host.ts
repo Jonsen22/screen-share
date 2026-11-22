@@ -25,20 +25,28 @@ const ICE_SERVERS: RTCIceServer[] = [
 
 export interface HostStartOptions {
   signalingUrl: string;
+  nickname: string;
   preset: QualityPresetId;
   contentHint: ContentHintMode;
   audioPid: number | null;
 }
 
+export interface ConnectedViewer {
+  id: string;
+  nickname: string;
+}
+
 export interface HostCallbacks {
   onRoomCreated: (code: string, maxViewers: number, previewStream: MediaStream) => void;
   onStreamChanged: (previewStream: MediaStream) => void;
-  onViewerCountChange: (count: number, maxViewers: number) => void;
+  onViewersChange: (viewers: ConnectedViewer[], maxViewers: number) => void;
   onEnded: (reason?: string) => void;
   onError: (message: string) => void;
 }
 
 interface ViewerPeer {
+  id: string;
+  nickname: string;
   pc: RTCPeerConnection;
   videoSender: RTCRtpSender | null;
   pendingIce: RTCIceCandidateInit[];
@@ -195,7 +203,7 @@ export class HostManager {
             }
           });
 
-          this.signaling.send({ type: "create_room" });
+          this.signaling.send({ type: "create_room", nickname: options.nickname });
         }
       );
 
@@ -212,7 +220,7 @@ export class HostManager {
       this.attachVideoEndedHandler(videoTrack);
 
       this.callbacks.onRoomCreated(roomInfo.code, roomInfo.maxViewers, videoStream);
-      this.callbacks.onViewerCountChange(0, this.maxViewers);
+      this.emitViewersChange();
     } catch (err) {
       await this.cleanup();
       throw err;
@@ -396,16 +404,35 @@ export class HostManager {
     this.outboundStream = null;
   }
 
+  kickViewer(viewerId: string): void {
+    if (!this.active) return;
+    if (!this.peers.has(viewerId)) return;
+    try {
+      this.signaling.send({ type: "kick_viewer", targetId: viewerId });
+    } catch {
+      // Ignore if socket already closed
+    }
+    this.removePeer(viewerId);
+    this.emitViewersChange();
+  }
+
+  private emitViewersChange(): void {
+    const viewers: ConnectedViewer[] = Array.from(this.peers.values()).map((peer) => ({
+      id: peer.id,
+      nickname: peer.nickname,
+    }));
+    this.callbacks.onViewersChange(viewers, this.maxViewers);
+  }
+
   private handleServerMessage(msg: ServerMessage): void {
     switch (msg.type) {
       case "viewer_joined":
-        this.callbacks.onViewerCountChange(msg.viewerCount, this.maxViewers);
-        void this.createPeerForViewer(msg.viewerId);
+        void this.createPeerForViewer(msg.viewerId, msg.nickname || "Viewer");
         break;
 
       case "viewer_left":
         this.removePeer(msg.viewerId);
-        this.callbacks.onViewerCountChange(msg.viewerCount, this.maxViewers);
+        this.emitViewersChange();
         break;
 
       case "signal":
@@ -418,13 +445,21 @@ export class HostManager {
     }
   }
 
-  private async createPeerForViewer(viewerId: string): Promise<void> {
+  private async createPeerForViewer(viewerId: string, nickname: string): Promise<void> {
     if (!this.outboundStream) return;
     this.removePeer(viewerId);
 
     const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-    const entry: ViewerPeer = { pc, videoSender: null, pendingIce: [], remoteSet: false };
+    const entry: ViewerPeer = {
+      id: viewerId,
+      nickname,
+      pc,
+      videoSender: null,
+      pendingIce: [],
+      remoteSet: false,
+    };
     this.peers.set(viewerId, entry);
+    this.emitViewersChange();
 
     for (const track of this.outboundStream.getTracks()) {
       const sender = pc.addTrack(track, this.outboundStream);
@@ -451,6 +486,7 @@ export class HostManager {
     pc.onconnectionstatechange = () => {
       if (pc.connectionState === "failed" || pc.connectionState === "closed") {
         this.removePeer(viewerId);
+        this.emitViewersChange();
       }
     };
 
@@ -466,8 +502,9 @@ export class HostManager {
         payload: { kind: "offer", sdp: pc.localDescription! },
       });
     } catch (err) {
-      this.callbacks.onError(`Failed to negotiate with viewer ${viewerId}: ${String(err)}`);
+      this.callbacks.onError(`Failed to negotiate with viewer ${nickname}: ${String(err)}`);
       this.removePeer(viewerId);
+      this.emitViewersChange();
     }
   }
 

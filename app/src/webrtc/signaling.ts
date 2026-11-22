@@ -5,9 +5,23 @@ export type SignalPayload =
 
 export type ServerMessage =
   | { type: "room_created"; code: string; maxViewers: number }
-  | { type: "joined_room"; code: string; viewerId: string; viewerCount: number; maxViewers: number }
-  | { type: "viewer_joined"; viewerId: string; viewerCount: number }
-  | { type: "viewer_left"; viewerId: string; viewerCount: number }
+  | {
+      type: "joined_room";
+      code: string;
+      viewerId: string;
+      hostNickname?: string;
+      viewerCount: number;
+      maxViewers: number;
+    }
+  | { type: "viewer_joined"; viewerId: string; nickname?: string; viewerCount: number }
+  | {
+      type: "viewer_left";
+      viewerId: string;
+      nickname?: string;
+      viewerCount: number;
+      kicked?: boolean;
+    }
+  | { type: "kicked"; reason: string }
   | { type: "room_closed"; reason: string }
   | { type: "signal"; fromId: string; payload: SignalPayload }
   | { type: "error"; code: string; message: string };

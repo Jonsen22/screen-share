@@ -7,8 +7,20 @@ const HOST = process.env.HOST || "0.0.0.0";
 const MAX_VIEWERS = 5;
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
-/** @type {Map<string, { host: WebSocket, viewers: Map<string, WebSocket>, createdAt: number }>} */
+const MAX_NICKNAME_LEN = 24;
+
+/** @type {Map<string, { host: WebSocket, hostNickname: string, viewers: Map<string, { ws: WebSocket, nickname: string }>, createdAt: number }>} */
 const rooms = new Map();
+
+function sanitizeNickname(input, fallback) {
+  if (typeof input !== "string") return fallback;
+  const cleaned = input
+    .replace(/[\u0000-\u001F\u007F]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, MAX_NICKNAME_LEN);
+  return cleaned || fallback;
+}
 
 function generateRoomCode() {
   for (let attempt = 0; attempt < 100; attempt++) {
@@ -45,9 +57,9 @@ function cleanupClient(ws) {
   if (!room) return;
 
   if (meta.role === "host") {
-    for (const viewerWs of room.viewers.values()) {
-      viewerWs._meta = null;
-      sendJson(viewerWs, {
+    for (const viewer of room.viewers.values()) {
+      viewer.ws._meta = null;
+      sendJson(viewer.ws, {
         type: "room_closed",
         reason: "Host ended the stream.",
       });
@@ -56,14 +68,16 @@ function cleanupClient(ws) {
     rooms.delete(meta.code);
     console.log(`[room ${meta.code}] closed (host left)`);
   } else if (meta.role === "viewer") {
-    if (room.viewers.delete(meta.viewerId)) {
+    const existing = room.viewers.get(meta.viewerId);
+    if (existing && room.viewers.delete(meta.viewerId)) {
       sendJson(room.host, {
         type: "viewer_left",
         viewerId: meta.viewerId,
+        nickname: existing.nickname,
         viewerCount: room.viewers.size,
       });
       console.log(
-        `[room ${meta.code}] viewer ${meta.viewerId} left (${room.viewers.size}/${MAX_VIEWERS})`
+        `[room ${meta.code}] viewer ${meta.viewerId} (${existing.nickname}) left (${room.viewers.size}/${MAX_VIEWERS})`
       );
     }
   }
@@ -108,18 +122,20 @@ wss.on("connection", (ws) => {
       case "create_room": {
         cleanupClient(ws);
         const code = generateRoomCode();
+        const hostNickname = sanitizeNickname(msg.nickname, "Host");
         rooms.set(code, {
           host: ws,
+          hostNickname,
           viewers: new Map(),
           createdAt: Date.now(),
         });
-        ws._meta = { role: "host", code };
+        ws._meta = { role: "host", code, nickname: hostNickname };
         sendJson(ws, {
           type: "room_created",
           code,
           maxViewers: MAX_VIEWERS,
         });
-        console.log(`[room ${code}] created`);
+        console.log(`[room ${code}] created by ${hostNickname}`);
         break;
       }
 
@@ -127,6 +143,39 @@ wss.on("connection", (ws) => {
         if (ws._meta?.role === "host") {
           cleanupClient(ws);
         }
+        break;
+      }
+
+      case "kick_viewer": {
+        const meta = ws._meta;
+        if (!meta || meta.role !== "host") return;
+        const room = rooms.get(meta.code);
+        if (!room) return;
+        const targetId = typeof msg.targetId === "string" ? msg.targetId : "";
+        const target = room.viewers.get(targetId);
+        if (!target) return;
+
+        room.viewers.delete(targetId);
+        target.ws._meta = null;
+        sendJson(target.ws, {
+          type: "kicked",
+          reason: "You were removed from the room by the host.",
+        });
+        try {
+          target.ws.close(4001, "Kicked by host");
+        } catch {
+          // Ignore close errors
+        }
+        sendJson(room.host, {
+          type: "viewer_left",
+          viewerId: targetId,
+          nickname: target.nickname,
+          viewerCount: room.viewers.size,
+          kicked: true,
+        });
+        console.log(
+          `[room ${meta.code}] viewer ${targetId} (${target.nickname}) kicked (${room.viewers.size}/${MAX_VIEWERS})`
+        );
         break;
       }
 
@@ -152,23 +201,26 @@ wss.on("connection", (ws) => {
         }
 
         const viewerId = crypto.randomUUID().slice(0, 8);
-        room.viewers.set(viewerId, ws);
-        ws._meta = { role: "viewer", code, viewerId };
+        const nickname = sanitizeNickname(msg.nickname, "Viewer");
+        room.viewers.set(viewerId, { ws, nickname });
+        ws._meta = { role: "viewer", code, viewerId, nickname };
 
         sendJson(ws, {
           type: "joined_room",
           code,
           viewerId,
+          hostNickname: room.hostNickname,
           viewerCount: room.viewers.size,
           maxViewers: MAX_VIEWERS,
         });
         sendJson(room.host, {
           type: "viewer_joined",
           viewerId,
+          nickname,
           viewerCount: room.viewers.size,
         });
         console.log(
-          `[room ${code}] viewer ${viewerId} joined (${room.viewers.size}/${MAX_VIEWERS})`
+          `[room ${code}] viewer ${viewerId} (${nickname}) joined (${room.viewers.size}/${MAX_VIEWERS})`
         );
         break;
       }
@@ -189,7 +241,7 @@ wss.on("connection", (ws) => {
         if (meta.role === "host") {
           const target = room.viewers.get(msg.targetId);
           if (target) {
-            sendJson(target, {
+            sendJson(target.ws, {
               type: "signal",
               fromId: "host",
               payload: msg.payload,
