@@ -12,15 +12,27 @@ export type ServerMessage =
   | { type: "signal"; fromId: string; payload: SignalPayload }
   | { type: "error"; code: string; message: string };
 
+export function normalizeSignalingUrl(raw: string): string {
+  const trimmed = raw.trim().replace(/\/+$/, "");
+  if (trimmed.startsWith("https://")) {
+    return "wss://" + trimmed.slice("https://".length);
+  }
+  if (trimmed.startsWith("http://")) {
+    return "ws://" + trimmed.slice("http://".length);
+  }
+  return trimmed;
+}
+
 export class SignalingClient {
   private ws: WebSocket | null = null;
   private listeners = new Set<(msg: ServerMessage) => void>();
   private closeListeners = new Set<(reason: string) => void>();
   private intentionalClose = false;
 
-  async connect(url: string, timeoutMs = 6000): Promise<void> {
+  async connect(rawUrl: string, timeoutMs = 65000): Promise<void> {
     this.close();
     this.intentionalClose = false;
+    const url = normalizeSignalingUrl(rawUrl);
 
     return new Promise((resolve, reject) => {
       let settled = false;

@@ -1,9 +1,10 @@
 import { AudioAppInfo, isTauriRuntime, listAudioApps } from "./audio/app-audio";
 import { ContentHintMode, HostManager, QualityPresetId } from "./webrtc/host";
+import { normalizeSignalingUrl } from "./webrtc/signaling";
 import { ViewerManager } from "./webrtc/viewer";
 
 const SIGNALING_STORAGE_KEY = "screen-share.signaling-url";
-const DEFAULT_SIGNALING_URL = "ws://localhost:8787";
+const DEFAULT_SIGNALING_URL = "wss://screen-share-wfrh.onrender.com";
 
 function el<T extends HTMLElement>(id: string): T {
   const node = document.getElementById(id);
@@ -74,16 +75,20 @@ let meterRafId: number | null = null;
 let currentRoomCode = "";
 
 // Initialize persisted signaling URL
+const savedUrl = window.localStorage.getItem(SIGNALING_STORAGE_KEY);
 signalingInput.value =
-  window.localStorage.getItem(SIGNALING_STORAGE_KEY) || DEFAULT_SIGNALING_URL;
+  savedUrl && savedUrl !== "ws://localhost:8787"
+    ? normalizeSignalingUrl(savedUrl)
+    : DEFAULT_SIGNALING_URL;
 signalingInput.addEventListener("change", () => {
-  const val = signalingInput.value.trim() || DEFAULT_SIGNALING_URL;
+  const val = normalizeSignalingUrl(signalingInput.value) || DEFAULT_SIGNALING_URL;
   signalingInput.value = val;
   window.localStorage.setItem(SIGNALING_STORAGE_KEY, val);
 });
 
 function getSignalingUrl(): string {
-  const val = signalingInput.value.trim() || DEFAULT_SIGNALING_URL;
+  const val = normalizeSignalingUrl(signalingInput.value) || DEFAULT_SIGNALING_URL;
+  signalingInput.value = val;
   window.localStorage.setItem(SIGNALING_STORAGE_KEY, val);
   return val;
 }
