@@ -1,4 +1,6 @@
 mod audio_capture;
+mod deep_link;
+mod discord;
 mod windows_list;
 
 use audio_capture::{AudioCaptureManager, LoopbackMode};
@@ -9,6 +11,7 @@ use windows_list::{AudioAppInfo, DiscordProcessInfo};
 
 pub struct AppState {
     audio: Mutex<AudioCaptureManager>,
+    pending_join_code: Mutex<Option<String>>,
 }
 
 #[tauri::command]
@@ -54,17 +57,43 @@ fn stop_app_audio(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn take_pending_join_code(state: State<'_, AppState>) -> Option<String> {
+    state.pending_join_code.lock().ok()?.take()
+}
+
+#[tauri::command]
+async fn send_discord_webhook(
+    webhook_url: String,
+    host_nickname: String,
+    room_code: String,
+    join_url: String,
+    quality: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        discord::send_webhook(&webhook_url, &host_nickname, &room_code, &join_url, &quality)
+    })
+    .await
+    .map_err(|e| format!("Discord webhook task failed: {e}"))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    deep_link::register_protocol_handler();
+    let initial_join_code = deep_link::parse_join_code_from_args();
+
     tauri::Builder::default()
         .manage(AppState {
             audio: Mutex::new(AudioCaptureManager::new()),
+            pending_join_code: Mutex::new(initial_join_code),
         })
         .invoke_handler(tauri::generate_handler![
             list_audio_apps,
             find_discord_app,
             start_app_audio,
             stop_app_audio,
+            take_pending_join_code,
+            send_discord_webhook,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::Destroyed = event {

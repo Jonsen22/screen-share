@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import {
   AudioAppInfo,
   AudioCaptureTarget,
@@ -17,6 +18,7 @@ const SIGNALING_STORAGE_KEY = import.meta.env.DEV
 const NICKNAME_STORAGE_KEY = "screen-share.nickname";
 const ONBOARDING_STORAGE_KEY = "screen-share.onboarding-seen";
 const DISMISSED_UPDATE_KEY = "screen-share.dismissed-update";
+const DISCORD_WEBHOOK_STORAGE_KEY = "screen-share.discord-webhook";
 const DEFAULT_SIGNALING_URL =
   normalizeSignalingUrl(import.meta.env.VITE_SIGNALING_URL ?? "") ||
   "wss://screen-share-wfrh.onrender.com";
@@ -68,6 +70,15 @@ const btnStartShare = el<HTMLButtonElement>("btn-start-share");
 const btnSwitchScreen = el<HTMLButtonElement>("btn-switch-screen");
 const btnStopShare = el<HTMLButtonElement>("btn-stop-share");
 const btnCopyCode = el<HTMLButtonElement>("btn-copy-code");
+const btnCopyLink = el<HTMLButtonElement>("btn-copy-link");
+const btnShareDiscord = el<HTMLButtonElement>("btn-share-discord");
+const btnDiscordSettings = el<HTMLButtonElement>("btn-discord-settings");
+const discordModal = el<HTMLElement>("discord-modal");
+const discordForm = el<HTMLFormElement>("discord-form");
+const discordWebhookInput = el<HTMLInputElement>("discord-webhook-input");
+const discordModalError = el<HTMLElement>("discord-modal-error");
+const btnDiscordCancel = el<HTMLButtonElement>("btn-discord-cancel");
+const btnDiscordSave = el<HTMLButtonElement>("btn-discord-save");
 const btnHostMonitor = el<HTMLButtonElement>("btn-host-monitor");
 const btnHostMute = el<HTMLButtonElement>("btn-host-mute");
 const hostPreview = el<HTMLVideoElement>("host-preview");
@@ -214,6 +225,19 @@ nicknameModal.addEventListener("click", (e) => {
   }
 });
 
+let pendingDeepLinkCode: string | null = null;
+
+function buildJoinUrl(code: string): string {
+  const wsUrl = getSignalingUrl();
+  if (wsUrl.startsWith("wss://")) {
+    return `https://${wsUrl.slice("wss://".length)}/join/${encodeURIComponent(code)}`;
+  }
+  if (wsUrl.startsWith("ws://")) {
+    return `http://${wsUrl.slice("ws://".length)}/join/${encodeURIComponent(code)}`;
+  }
+  return `screenshare://join/${encodeURIComponent(code)}`;
+}
+
 nicknameForm.addEventListener("submit", (e) => {
   e.preventDefault();
   const cleaned = sanitizeNickname(nicknameInput.value);
@@ -225,7 +249,12 @@ nicknameForm.addEventListener("submit", (e) => {
   setNickname(cleaned);
   nicknameModalRequired = false;
   closeNicknameModal();
-  if (pendingOnboardingAfterNickname) {
+  if (pendingDeepLinkCode) {
+    const codeToJoin = pendingDeepLinkCode;
+    pendingDeepLinkCode = null;
+    pendingOnboardingAfterNickname = false;
+    void triggerDeepLinkJoin(codeToJoin);
+  } else if (pendingOnboardingAfterNickname) {
     pendingOnboardingAfterNickname = false;
     openIntroModal();
   }
@@ -593,6 +622,117 @@ btnCopyCode.addEventListener("click", async () => {
   }
 });
 
+btnCopyLink.addEventListener("click", async () => {
+  if (!currentRoomCode) return;
+  const url = buildJoinUrl(currentRoomCode);
+  try {
+    await navigator.clipboard.writeText(url);
+    btnCopyLink.textContent = "Link Copied!";
+    window.setTimeout(() => {
+      btnCopyLink.textContent = "Copy Link";
+    }, 1500);
+  } catch {
+    btnCopyLink.textContent = "Copy Failed";
+  }
+});
+
+let shareAfterWebhookSave = false;
+
+function getSavedDiscordWebhook(): string {
+  return (window.localStorage.getItem(DISCORD_WEBHOOK_STORAGE_KEY) || "").trim();
+}
+
+function openDiscordModal(autoShareOnSave: boolean): void {
+  shareAfterWebhookSave = autoShareOnSave;
+  discordWebhookInput.value = getSavedDiscordWebhook();
+  showAlert(discordModalError, null);
+  btnDiscordSave.textContent = autoShareOnSave ? "Save & Share" : "Save Webhook";
+  discordModal.classList.remove("hidden");
+  discordWebhookInput.focus();
+  discordWebhookInput.select();
+}
+
+function closeDiscordModal(): void {
+  discordModal.classList.add("hidden");
+  showAlert(discordModalError, null);
+}
+
+async function postRoomToDiscord(webhookUrl: string): Promise<void> {
+  if (!currentRoomCode) return;
+  showAlert(hostLiveError, null);
+  if (!isTauriRuntime()) {
+    showAlert(hostLiveError, "Sharing to Discord requires the Windows desktop app.");
+    return;
+  }
+
+  btnShareDiscord.disabled = true;
+  btnShareDiscord.textContent = "Posting...";
+  try {
+    const joinUrl = buildJoinUrl(currentRoomCode);
+    const qualityLabel = livePresetSelect.selectedOptions[0]?.textContent || "1080p · 30 fps";
+    await invoke("send_discord_webhook", {
+      webhookUrl,
+      hostNickname: currentNickname || "Host",
+      roomCode: currentRoomCode,
+      joinUrl,
+      quality: qualityLabel,
+    });
+    btnShareDiscord.textContent = "Shared to Discord!";
+    window.setTimeout(() => {
+      btnShareDiscord.textContent = "Share to Discord";
+      btnShareDiscord.disabled = false;
+    }, 2200);
+  } catch (err) {
+    btnShareDiscord.textContent = "Share to Discord";
+    btnShareDiscord.disabled = false;
+    showAlert(hostLiveError, err instanceof Error ? err.message : String(err));
+  }
+}
+
+btnShareDiscord.addEventListener("click", () => {
+  const saved = getSavedDiscordWebhook();
+  if (!saved) {
+    openDiscordModal(true);
+    return;
+  }
+  void postRoomToDiscord(saved);
+});
+
+btnDiscordSettings.addEventListener("click", () => {
+  openDiscordModal(false);
+});
+
+btnDiscordCancel.addEventListener("click", () => closeDiscordModal());
+discordModal.addEventListener("click", (e) => {
+  if (e.target === discordModal) {
+    closeDiscordModal();
+  }
+});
+
+discordForm.addEventListener("submit", (e) => {
+  e.preventDefault();
+  const raw = discordWebhookInput.value.trim();
+  if (!raw) {
+    window.localStorage.removeItem(DISCORD_WEBHOOK_STORAGE_KEY);
+    closeDiscordModal();
+    return;
+  }
+  if (!/^https:\/\/(discord\.com|discordapp\.com|ptb\.discord\.com|canary\.discord\.com)\/api\/webhooks\//i.test(raw)) {
+    showAlert(
+      discordModalError,
+      "Enter a valid Discord webhook URL (https://discord.com/api/webhooks/...)."
+    );
+    discordWebhookInput.focus();
+    return;
+  }
+  window.localStorage.setItem(DISCORD_WEBHOOK_STORAGE_KEY, raw);
+  const shouldShare = shareAfterWebhookSave;
+  closeDiscordModal();
+  if (shouldShare && currentRoomCode) {
+    void postRoomToDiscord(raw);
+  }
+});
+
 liveAudioAppSelect.addEventListener("change", async () => {
   showAlert(hostLiveError, null);
   updateAudioHint(liveAudioAppSelect, liveAudioAppHint);
@@ -768,6 +908,12 @@ btnFullscreen.addEventListener("click", () => void toggleFullscreen());
 viewerVideo.addEventListener("dblclick", () => void toggleFullscreen());
 
 window.addEventListener("keydown", (e) => {
+  if (!discordModal.classList.contains("hidden")) {
+    if (e.key === "Escape") {
+      closeDiscordModal();
+    }
+    return;
+  }
   if (!introModal.classList.contains("hidden")) {
     if (e.key === "Escape") {
       closeIntroModal();
@@ -804,9 +950,29 @@ if (savedNickname) {
 // Non-blocking startup version check against signaling server's /version endpoint
 void runStartupVersionCheck();
 
-// Initial app enumeration (in Tauri desktop runtime)
+async function triggerDeepLinkJoin(code: string): Promise<void> {
+  if (isHosting || isWatching) return;
+  closeIntroModal();
+  setMode("viewer");
+  roomCodeInput.value = code;
+  if (!currentNickname) {
+    pendingDeepLinkCode = code;
+    openNicknameModal(true);
+    return;
+  }
+  viewerJoinForm.requestSubmit();
+}
+
+// Initial app enumeration & deep-link check (in Tauri desktop runtime)
 if (isTauriRuntime()) {
   void refreshAudioApps();
+  void invoke<string | null>("take_pending_join_code")
+    .then((code) => {
+      if (code) {
+        void triggerDeepLinkJoin(code);
+      }
+    })
+    .catch(() => {});
 } else {
   const hint = document.createElement("option");
   hint.value = "";

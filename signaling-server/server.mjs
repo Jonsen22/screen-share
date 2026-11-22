@@ -10,7 +10,7 @@ const VIEWER_GRACE_MS = 30_000;
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 const MAX_NICKNAME_LEN = 24;
-const LATEST_APP_VERSION = (process.env.LATEST_APP_VERSION || "1.1.0").trim();
+const LATEST_APP_VERSION = (process.env.LATEST_APP_VERSION || "1.2.0").trim();
 const APP_DOWNLOAD_URL = (
   process.env.APP_DOWNLOAD_URL || "https://github.com/Jonsen22/screen-share/releases/latest"
 ).trim();
@@ -181,8 +181,104 @@ function cleanupClient(ws, explicit = false) {
   }
 }
 
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function renderJoinPage(code, room) {
+  const safeCode = escapeHtml(code);
+  const deepLink = `screenshare://join/${encodeURIComponent(code)}`;
+  const downloadUrl = escapeHtml(APP_DOWNLOAD_URL);
+  const isLive = Boolean(room && room.host);
+  const hostName = isLive ? escapeHtml(room.hostNickname || "Host") : null;
+  const title = hostName
+    ? `${hostName} is live on screen-share (${safeCode})`
+    : `Join screen-share room ${safeCode}`;
+  const subtitle = hostName
+    ? `${hostName} is streaming right now. Click below to open screen-share and join automatically.`
+    : `Open screen-share to join room ${safeCode}.`;
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${title}</title>
+  <meta property="og:title" content="${title}" />
+  <meta property="og:description" content="Direct P2P Windows screen sharing with isolated per-app audio. Room code: ${safeCode}" />
+  <meta name="theme-color" content="#5865F2" />
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      min-height: 100vh; display: flex; align-items: center; justify-content: center;
+      background: #0f1116; color: #eef1f7; font-family: "Segoe UI", system-ui, sans-serif;
+      padding: 20px;
+    }
+    .card {
+      width: 100%; max-width: 440px; background: #171a22; border: 1px solid #2a3040;
+      border-radius: 12px; padding: 28px; text-align: center;
+    }
+    .badge {
+      display: inline-block; font-size: 12px; font-weight: 700; letter-spacing: .06em;
+      padding: 4px 10px; border-radius: 999px; margin-bottom: 14px;
+      background: ${isLive ? "rgba(35,165,90,.18)" : "rgba(88,101,242,.18)"};
+      color: ${isLive ? "#7df2a8" : "#9ba5ff"};
+    }
+    h1 { font-size: 20px; margin-bottom: 8px; }
+    p { color: #939db2; font-size: 14px; line-height: 1.5; margin-bottom: 20px; }
+    .code {
+      font-family: Consolas, monospace; font-size: 26px; font-weight: 700; letter-spacing: .12em;
+      background: #0f1116; border: 1px solid #2a3040; border-radius: 8px; padding: 12px;
+      margin-bottom: 18px; user-select: all;
+    }
+    .btn {
+      display: block; width: 100%; padding: 12px 16px; border-radius: 8px; border: none;
+      font-size: 14px; font-weight: 600; text-decoration: none; cursor: pointer;
+      margin-bottom: 10px;
+    }
+    .btn-primary { background: #5865f2; color: #fff; }
+    .btn-primary:hover { background: #4752c4; }
+    .btn-secondary { background: #1f2430; color: #eef1f7; border: 1px solid #2a3040; }
+    .small { font-size: 12px; color: #939db2; margin-top: 10px; }
+    .small a { color: #8c9eff; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="badge">${isLive ? "LIVE NOW" : "SCREEN-SHARE ROOM"}</div>
+    <h1>${hostName ? `${hostName} is sharing their screen` : "Join screen-share"}</h1>
+    <p>${subtitle}</p>
+    <div class="code" id="code">${safeCode}</div>
+    <a class="btn btn-primary" href="${deepLink}">Open in screen-share</a>
+    <button class="btn btn-secondary" id="copy-btn" type="button">Copy Room Code</button>
+    <div class="small">
+      Don't have the app yet? <a href="${downloadUrl}" target="_blank" rel="noopener">Download screen-share for Windows</a>
+    </div>
+  </div>
+  <script>
+    window.setTimeout(function () { window.location.href = ${JSON.stringify(deepLink)}; }, 150);
+    document.getElementById("copy-btn").addEventListener("click", function () {
+      var btn = this;
+      if (navigator.clipboard) {
+        navigator.clipboard.writeText(${JSON.stringify(code)}).then(function () {
+          btn.textContent = "Copied!";
+          setTimeout(function () { btn.textContent = "Copy Room Code"; }, 1500);
+        });
+      }
+    });
+  </script>
+</body>
+</html>`;
+}
+
 const server = http.createServer((req, res) => {
-  if (req.url === "/health") {
+  const reqPath = (req.url || "/").split("?")[0];
+  if (reqPath === "/health") {
     res.writeHead(200, {
       "Content-Type": "application/json",
       "Access-Control-Allow-Origin": "*",
@@ -198,7 +294,7 @@ const server = http.createServer((req, res) => {
     );
     return;
   }
-  if (req.url === "/version") {
+  if (reqPath === "/version") {
     res.writeHead(200, {
       "Content-Type": "application/json",
       "Access-Control-Allow-Origin": "*",
@@ -211,6 +307,22 @@ const server = http.createServer((req, res) => {
         releaseNotes: APP_RELEASE_NOTES,
       })
     );
+    return;
+  }
+  if (reqPath.startsWith("/join/")) {
+    const rawCode = decodeURIComponent(reqPath.slice("/join/".length));
+    const code = normalizeCode(rawCode);
+    if (!isValidNormalizedCode(code)) {
+      res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("Invalid room code.\n");
+      return;
+    }
+    const room = rooms.get(code) || null;
+    res.writeHead(200, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
+    });
+    res.end(renderJoinPage(code, room));
     return;
   }
   res.writeHead(200, { "Content-Type": "text/plain" });

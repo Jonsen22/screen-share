@@ -165,6 +165,23 @@
                     Copy
                   </button>
                 </div>
+                <div class="share-actions-row">
+                  <button id="btn-copy-link" class="btn btn-secondary btn-sm" type="button">
+                    Copy Link
+                  </button>
+                  <button id="btn-share-discord" class="btn btn-discord btn-sm" type="button">
+                    Share to Discord
+                  </button>
+                  <button
+                    id="btn-discord-settings"
+                    class="btn btn-ghost btn-sm btn-icon"
+                    type="button"
+                    title="Configure Discord Webhook"
+                    aria-label="Configure Discord Webhook"
+                  >
+                    ⚙
+                  </button>
+                </div>
                 <p id="host-status-text" class="muted small">Waiting for viewers to join...</p>
               </div>
 
@@ -417,6 +434,40 @@
               </button>
               <button id="btn-nickname-save" class="btn btn-primary" type="submit">
                 Save Nickname
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+
+      <!-- DISCORD WEBHOOK MODAL -->
+      <div id="discord-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="discord-modal-title">
+        <div class="modal-card">
+          <h2 id="discord-modal-title">Discord Share Webhook</h2>
+          <p class="muted small">
+            Paste a Discord channel webhook URL to post your live room link in 1 click. It is stored locally on your PC and never sent to any third-party server.
+          </p>
+          <p class="muted small">
+            In Discord: <strong>Channel Settings → Integrations → Webhooks → New Webhook → Copy Webhook URL</strong>.
+          </p>
+          <form id="discord-form" class="modal-form">
+            <div class="field">
+              <label for="discord-webhook-input">Discord Webhook URL</label>
+              <input
+                id="discord-webhook-input"
+                type="text"
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="https://discord.com/api/webhooks/..."
+              />
+            </div>
+            <div id="discord-modal-error" class="alert alert-error hidden"></div>
+            <div class="actions-row">
+              <button id="btn-discord-cancel" class="btn btn-ghost" type="button">
+                Cancel
+              </button>
+              <button id="btn-discord-save" class="btn btn-primary" type="submit">
+                Save &amp; Share
               </button>
             </div>
           </form>
