@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>screen-share</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div id="app" class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-dot" aria-hidden="true"></span>
+          <span class="brand-name">screen-share</span>
+          <span class="brand-tag">P2P · WASAPI</span>
+        </div>
+
+        <nav class="mode-tabs" role="tablist" aria-label="App Mode">
+          <button id="tab-host" class="mode-tab active" role="tab" aria-selected="true">
+            Share Screen
+          </button>
+          <button id="tab-viewer" class="mode-tab" role="tab" aria-selected="false">
+            Watch Stream
+          </button>
+        </nav>
+
+        <div class="server-config">
+          <label class="server-label" for="signaling-url">Signaling</label>
+          <input
+            id="signaling-url"
+            class="server-input"
+            type="text"
+            spellcheck="false"
+            placeholder="ws://localhost:8787"
+          />
+        </div>
+      </header>
+
+      <main class="main-content">
+        <!-- HOST VIEW -->
+        <section id="view-host" class="view active">
+          <!-- Host Setup Card -->
+          <div id="host-setup" class="panel setup-panel">
+            <div class="panel-head">
+              <h1>Share Your Screen</h1>
+              <p class="muted">
+                Direct peer-to-peer WebRTC stream for up to 5 viewers with isolated per-application audio.
+              </p>
+            </div>
+
+            <div class="form-grid">
+              <div class="field">
+                <label for="preset-select">Quality Preset</label>
+                <select id="preset-select">
+                  <option value="720p30">720p · 30 fps (2.5 Mbps)</option>
+                  <option value="1080p30" selected>1080p · 30 fps (4.5 Mbps)</option>
+                  <option value="1080p60">1080p · 60 fps (8.0 Mbps)</option>
+                  <option value="source60">Native Source · 60 fps (10.0 Mbps)</option>
+                </select>
+              </div>
+
+              <div class="field">
+                <label for="hint-select">Encoding Priority</label>
+                <select id="hint-select">
+                  <option value="motion" selected>Smooth Motion (Games / Video)</option>
+                  <option value="detail">Sharp Text (Code / Slides)</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="field">
+              <div class="field-label-row">
+                <label for="audio-app-select">Application Audio (Windows WASAPI)</label>
+                <button id="btn-refresh-apps" class="btn btn-ghost btn-sm" type="button">
+                  Refresh Apps
+                </button>
+              </div>
+              <select id="audio-app-select">
+                <option value="">No Audio (Video Only)</option>
+              </select>
+              <p class="field-hint">
+                Only captures audio from the selected application and its child processes — never system notifications or voice chat.
+              </p>
+            </div>
+
+            <div id="host-error" class="alert alert-error hidden"></div>
+
+            <div class="actions-row">
+              <button id="btn-start-share" class="btn btn-primary btn-lg" type="button">
+                Pick Screen &amp; Start Sharing
+              </button>
+            </div>
+          </div>
+
+          <!-- Host Live Stage -->
+          <div id="host-live" class="live-layout hidden">
+            <div class="stage-card">
+              <div class="stage-overlay-top">
+                <span class="live-pill"><span class="live-dot"></span>LIVE</span>
+                <span id="host-video-meta" class="meta-pill">Connecting...</span>
+                <span id="host-viewer-pill" class="meta-pill">0 / 5 Viewers</span>
+              </div>
+              <video id="host-preview" class="video-surface" autoplay muted playsinline></video>
+            </div>
+
+            <aside class="sidebar-card">
+              <div class="room-box">
+                <span class="room-label">ROOM CODE</span>
+                <div class="room-code-row">
+                  <code id="host-room-code" class="room-code">---- ----</code>
+                  <button id="btn-copy-code" class="btn btn-secondary btn-sm" type="button">
+                    Copy
+                  </button>
+                </div>
+                <p id="host-status-text" class="muted small">Waiting for viewers to join...</p>
+              </div>
+
+              <div class="divider"></div>
+
+              <div class="field">
+                <div class="field-label-row">
+                  <label for="live-audio-app-select">Audio Source</label>
+                  <button id="btn-live-refresh-apps" class="btn btn-ghost btn-sm" type="button">
+                    Refresh
+                  </button>
+                </div>
+                <select id="live-audio-app-select">
+                  <option value="">No Audio (Video Only)</option>
+                </select>
+              </div>
+
+              <div class="meter-block">
+                <div class="field-label-row">
+                  <span class="small muted">App Audio Level</span>
+                  <button id="btn-host-mute" class="btn btn-ghost btn-sm" type="button">
+                    Mute Audio
+                  </button>
+                </div>
+                <div class="meter-track">
+                  <div id="host-audio-meter" class="meter-fill"></div>
+                </div>
+              </div>
+
+              <div id="host-live-error" class="alert alert-error hidden"></div>
+
+              <div class="sidebar-spacer"></div>
+
+              <button id="btn-stop-share" class="btn btn-danger btn-lg full-width" type="button">
+                Stop Sharing
+              </button>
+            </aside>
+          </div>
+        </section>
+
+        <!-- VIEWER VIEW -->
+        <section id="view-viewer" class="view">
+          <!-- Viewer Join Card -->
+          <div id="viewer-join" class="panel setup-panel">
+            <div class="panel-head">
+              <h1>Watch a Stream</h1>
+              <p class="muted">
+                Enter the 8-character room code from the host to connect directly over WebRTC.
+              </p>
+            </div>
+
+            <form id="viewer-join-form" class="join-form">
+              <div class="field">
+                <label for="room-code-input">Room Code</label>
+                <input
+                  id="room-code-input"
+                  class="code-input"
+                  type="text"
+                  maxlength="9"
+                  autocomplete="off"
+                  spellcheck="false"
+                  placeholder="ABCD-1234"
+                  required
+                />
+              </div>
+
+              <div id="viewer-error" class="alert alert-error hidden"></div>
+
+              <div class="actions-row">
+                <button id="btn-join-room" class="btn btn-primary btn-lg" type="submit">
+                  Join Stream
+                </button>
+              </div>
+            </form>
+          </div>
+
+          <!-- Viewer Watching Stage -->
+          <div id="viewer-stage" class="viewer-stage hidden">
+            <div id="viewer-video-wrap" class="stage-card viewer-video-card">
+              <video id="viewer-video" class="video-surface" autoplay playsinline></video>
+
+              <div id="viewer-banner" class="center-banner hidden">
+                <span id="viewer-banner-text">Connecting to host...</span>
+              </div>
+
+              <div id="stats-hud" class="stats-hud hidden">
+                <div class="stats-title">Stream Telemetry</div>
+                <dl class="stats-grid">
+                  <dt>Resolution</dt><dd id="stat-res">-</dd>
+                  <dt>FPS</dt><dd id="stat-fps">-</dd>
+                  <dt>Bitrate</dt><dd id="stat-bitrate">-</dd>
+                  <dt>Latency (RTT)</dt><dd id="stat-rtt">-</dd>
+                  <dt>Packet Loss</dt><dd id="stat-loss">-</dd>
+                  <dt>Codec</dt><dd id="stat-codec">-</dd>
+                  <dt>State</dt><dd id="stat-state">-</dd>
+                </dl>
+              </div>
+
+              <div class="viewer-controls">
+                <div class="controls-left">
+                  <span id="viewer-room-badge" class="meta-pill">----</span>
+                  <button id="btn-viewer-mute" class="btn btn-ghost btn-sm" type="button">
+                    Mute
+                  </button>
+                  <input
+                    id="viewer-volume"
+                    class="volume-slider"
+                    type="range"
+                    min="0"
+                    max="1"
+                    step="0.02"
+                    value="1"
+                    aria-label="Volume"
+                  />
+                </div>
+                <div class="controls-right">
+                  <button id="btn-toggle-stats" class="btn btn-ghost btn-sm" type="button">
+                    Stats (I)
+                  </button>
+                  <button id="btn-fullscreen" class="btn btn-ghost btn-sm" type="button">
+                    Fullscreen (F)
+                  </button>
+                  <button id="btn-leave-room" class="btn btn-danger btn-sm" type="button">
+                    Leave
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

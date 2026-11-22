@@ -1,0 +1,13 @@
+{
+  "name": "screen-share-signaling",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Lightweight WebSocket signaling server for screen-share (1 host to up to 5 viewers)",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

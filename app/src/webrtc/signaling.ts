@@ -1,0 +1,113 @@
+export type SignalPayload =
+  | { kind: "offer"; sdp: RTCSessionDescriptionInit }
+  | { kind: "answer"; sdp: RTCSessionDescriptionInit }
+  | { kind: "ice"; candidate: RTCIceCandidateInit };
+
+export type ServerMessage =
+  | { type: "room_created"; code: string; maxViewers: number }
+  | { type: "joined_room"; code: string; viewerId: string; viewerCount: number; maxViewers: number }
+  | { type: "viewer_joined"; viewerId: string; viewerCount: number }
+  | { type: "viewer_left"; viewerId: string; viewerCount: number }
+  | { type: "room_closed"; reason: string }
+  | { type: "signal"; fromId: string; payload: SignalPayload }
+  | { type: "error"; code: string; message: string };
+
+export class SignalingClient {
+  private ws: WebSocket | null = null;
+  private listeners = new Set<(msg: ServerMessage) => void>();
+  private closeListeners = new Set<(reason: string) => void>();
+  private intentionalClose = false;
+
+  async connect(url: string, timeoutMs = 6000): Promise<void> {
+    this.close();
+    this.intentionalClose = false;
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let socket: WebSocket;
+      try {
+        socket = new WebSocket(url);
+      } catch (err) {
+        reject(new Error(`Invalid signaling server URL: ${String(err)}`));
+        return;
+      }
+
+      const timer = window.setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          socket.close();
+          reject(new Error(`Timed out connecting to signaling server (${url}).`));
+        }
+      }, timeoutMs);
+
+      socket.onopen = () => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        this.ws = socket;
+        resolve();
+      };
+
+      socket.onerror = () => {
+        if (!settled) {
+          settled = true;
+          window.clearTimeout(timer);
+          reject(new Error(`Could not connect to signaling server (${url}). Is it running?`));
+        }
+      };
+
+      socket.onmessage = (event) => {
+        try {
+          const parsed = JSON.parse(String(event.data)) as ServerMessage;
+          for (const listener of this.listeners) {
+            listener(parsed);
+          }
+        } catch {
+          // Ignore malformed frames
+        }
+      };
+
+      socket.onclose = () => {
+        if (this.ws === socket) {
+          this.ws = null;
+        }
+        if (!this.intentionalClose && settled) {
+          for (const listener of this.closeListeners) {
+            listener("Disconnected from signaling server.");
+          }
+        }
+      };
+    });
+  }
+
+  onMessage(handler: (msg: ServerMessage) => void): () => void {
+    this.listeners.add(handler);
+    return () => this.listeners.delete(handler);
+  }
+
+  onClose(handler: (reason: string) => void): () => void {
+    this.closeListeners.add(handler);
+    return () => this.closeListeners.delete(handler);
+  }
+
+  send(msg: Record<string, unknown>): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error("Signaling socket is not connected.");
+    }
+    this.ws.send(JSON.stringify(msg));
+  }
+
+  close(): void {
+    this.intentionalClose = true;
+    if (this.ws) {
+      try {
+        this.ws.close();
+      } catch {
+        // Ignore
+      }
+      this.ws = null;
+    }
+    this.listeners.clear();
+    this.closeListeners.clear();
+  }
+}
