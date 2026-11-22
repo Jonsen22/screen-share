@@ -5,6 +5,12 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use tauri::ipc::{Channel, InvokeResponseBody};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopbackMode {
+    Include,
+    Exclude,
+}
+
 pub struct AudioCaptureManager {
     stop_flag: Option<Arc<AtomicBool>>,
     worker: Option<JoinHandle<()>>,
@@ -28,7 +34,12 @@ impl AudioCaptureManager {
     }
 
     #[cfg(windows)]
-    pub fn start(&mut self, pid: u32, channel: Channel<InvokeResponseBody>) -> Result<(), String> {
+    pub fn start(
+        &mut self,
+        pid: u32,
+        mode: LoopbackMode,
+        channel: Channel<InvokeResponseBody>,
+    ) -> Result<(), String> {
         self.stop();
 
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -38,7 +49,7 @@ impl AudioCaptureManager {
         let handle = thread::Builder::new()
             .name(format!("wasapi-loopback-{pid}"))
             .spawn(move || {
-                windows_impl::capture_thread(pid, channel, worker_stop, ready_tx);
+                windows_impl::capture_thread(pid, mode, channel, worker_stop, ready_tx);
             })
             .map_err(|e| format!("Failed to spawn audio capture thread: {e}"))?;
 
@@ -60,7 +71,12 @@ impl AudioCaptureManager {
     }
 
     #[cfg(not(windows))]
-    pub fn start(&mut self, _pid: u32, _channel: Channel<InvokeResponseBody>) -> Result<(), String> {
+    pub fn start(
+        &mut self,
+        _pid: u32,
+        _mode: LoopbackMode,
+        _channel: Channel<InvokeResponseBody>,
+    ) -> Result<(), String> {
         Err("Per-application WASAPI audio capture is only supported on Windows.".to_string())
     }
 }
@@ -73,6 +89,7 @@ impl Drop for AudioCaptureManager {
 
 #[cfg(windows)]
 mod windows_impl {
+    use super::LoopbackMode;
     use std::mem::ManuallyDrop;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -90,6 +107,7 @@ mod windows_impl {
         AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
         AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
         AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
+        PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
         PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
         WAVEFORMATEX,
     };
@@ -155,13 +173,20 @@ mod windows_impl {
         }
     }
 
-    unsafe fn activate_process_loopback_client(pid: u32) -> Result<IAudioClient, String> {
+    unsafe fn activate_process_loopback_client(
+        pid: u32,
+        mode: LoopbackMode,
+    ) -> Result<IAudioClient, String> {
+        let loopback_mode = match mode {
+            LoopbackMode::Include => PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+            LoopbackMode::Exclude => PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+        };
         let mut activation_params = AUDIOCLIENT_ACTIVATION_PARAMS {
             ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
             Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
                 ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
                     TargetProcessId: pid,
-                    ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+                    ProcessLoopbackMode: loopback_mode,
                 },
             },
         };
@@ -218,6 +243,7 @@ mod windows_impl {
 
     pub fn capture_thread(
         pid: u32,
+        mode: LoopbackMode,
         channel: Channel<InvokeResponseBody>,
         stop_flag: Arc<AtomicBool>,
         ready_tx: SyncSender<Result<(), String>>,
@@ -230,7 +256,7 @@ mod windows_impl {
             }
 
             let init_res = (|| -> Result<(IAudioClient, IAudioCaptureClient, HANDLE), String> {
-                let audio_client = activate_process_loopback_client(pid)?;
+                let audio_client = activate_process_loopback_client(pid, mode)?;
 
                 let format = WAVEFORMATEX {
                     wFormatTag: WAVE_FORMAT_IEEE_FLOAT,
@@ -357,40 +383,42 @@ mod windows_impl {
                 assert!(hr.is_ok(), "CoInitializeEx failed: {hr:?}");
 
                 let pid = GetCurrentProcessId();
-                let client = activate_process_loopback_client(pid)
-                    .expect("activate_process_loopback_client should succeed");
+                for mode in [LoopbackMode::Include, LoopbackMode::Exclude] {
+                    let client = activate_process_loopback_client(pid, mode)
+                        .expect("activate_process_loopback_client should succeed");
 
-                let format = WAVEFORMATEX {
-                    wFormatTag: WAVE_FORMAT_IEEE_FLOAT,
-                    nChannels: CHANNELS,
-                    nSamplesPerSec: SAMPLE_RATE,
-                    nAvgBytesPerSec: SAMPLE_RATE * (BLOCK_ALIGN as u32),
-                    nBlockAlign: BLOCK_ALIGN,
-                    wBitsPerSample: BITS_PER_SAMPLE,
-                    cbSize: 0,
-                };
+                    let format = WAVEFORMATEX {
+                        wFormatTag: WAVE_FORMAT_IEEE_FLOAT,
+                        nChannels: CHANNELS,
+                        nSamplesPerSec: SAMPLE_RATE,
+                        nAvgBytesPerSec: SAMPLE_RATE * (BLOCK_ALIGN as u32),
+                        nBlockAlign: BLOCK_ALIGN,
+                        wBitsPerSample: BITS_PER_SAMPLE,
+                        cbSize: 0,
+                    };
 
-                let stream_flags = AUDCLNT_STREAMFLAGS_LOOPBACK
-                    | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
-                    | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
-                    | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+                    let stream_flags = AUDCLNT_STREAMFLAGS_LOOPBACK
+                        | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+                        | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+                        | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
 
-                let init_res = client.Initialize(
-                    AUDCLNT_SHAREMODE_SHARED,
-                    stream_flags,
-                    BUFFER_DURATION_100NS,
-                    0,
-                    &format,
-                    None,
-                );
-                assert!(init_res.is_ok(), "IAudioClient::Initialize failed: {init_res:?}");
+                    let init_res = client.Initialize(
+                        AUDCLNT_SHAREMODE_SHARED,
+                        stream_flags,
+                        BUFFER_DURATION_100NS,
+                        0,
+                        &format,
+                        None,
+                    );
+                    assert!(init_res.is_ok(), "IAudioClient::Initialize failed: {init_res:?}");
 
-                let ev = CreateEventW(None, false, false, None).unwrap();
-                client.SetEventHandle(ev).expect("SetEventHandle failed");
-                let _cap: IAudioCaptureClient = client.GetService().expect("GetService failed");
-                client.Start().expect("Start failed");
-                client.Stop().expect("Stop failed");
-                let _ = CloseHandle(ev);
+                    let ev = CreateEventW(None, false, false, None).unwrap();
+                    client.SetEventHandle(ev).expect("SetEventHandle failed");
+                    let _cap: IAudioCaptureClient = client.GetService().expect("GetService failed");
+                    client.Start().expect("Start failed");
+                    client.Stop().expect("Stop failed");
+                    let _ = CloseHandle(ev);
+                }
                 CoUninitialize();
             }
         }
