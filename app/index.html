@@ -51,8 +51,38 @@
               <path d="M16.5 3.5a2.12 2.12 0 1 1 3 3L7 19l-4 1 1-4Z" />
             </svg>
           </button>
+          <button
+            id="btn-open-intro"
+            class="icon-btn"
+            type="button"
+            title="About screen-share &amp; quick guide"
+            aria-label="About screen-share and quick guide"
+          >
+            ?
+          </button>
         </div>
       </header>
+
+      <div id="update-banner" class="update-banner hidden" role="status">
+        <div class="update-banner-text">
+          <span class="update-pill">UPDATE</span>
+          <span id="update-banner-msg">A new version is available.</span>
+        </div>
+        <div class="update-banner-actions">
+          <a
+            id="update-download-link"
+            class="btn btn-primary btn-sm"
+            href="#"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            Download
+          </a>
+          <button id="btn-dismiss-update" class="btn btn-ghost btn-sm" type="button" aria-label="Dismiss update banner">
+            Dismiss
+          </button>
+        </div>
+      </div>
 
       <main class="main-content">
         <!-- HOST VIEW -->
@@ -314,6 +344,46 @@
           </div>
         </section>
       </main>
+
+      <!-- APP INTRO / ONBOARDING MODAL -->
+      <div id="intro-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="intro-modal-title">
+        <div class="modal-card modal-card-wide">
+          <div class="intro-head">
+            <div>
+              <h2 id="intro-modal-title">Welcome to screen-share</h2>
+              <p class="muted small">Lightweight, Discord-style screen sharing for Windows — nothing else.</p>
+            </div>
+            <span id="intro-app-version" class="brand-tag">v0.1.0</span>
+          </div>
+
+          <ul class="intro-list">
+            <li class="intro-item">
+              <div class="intro-item-title">Direct P2P &amp; Encrypted</div>
+              <p class="muted small">
+                Video and audio stream directly between peers using DTLS-SRTP encryption. The signaling server only handles room codes and WebRTC handshakes.
+              </p>
+            </li>
+            <li class="intro-item">
+              <div class="intro-item-title">Isolated Per-App Audio (WASAPI)</div>
+              <p class="muted small">
+                Only the Windows application you pick is captured — never your system notifications or Discord voice chat.
+              </p>
+            </li>
+            <li class="intro-item">
+              <div class="intro-item-title">Quick Tips &amp; Shortcuts</div>
+              <p class="muted small">
+                Hosts can switch screens, quality, or audio source live without closing the room. While watching, press <kbd>I</kbd> for the telemetry HUD and <kbd>F</kbd> (or double-click) for fullscreen.
+              </p>
+            </li>
+          </ul>
+
+          <div class="actions-row">
+            <button id="btn-intro-close" class="btn btn-primary" type="button">
+              Got it
+            </button>
+          </div>
+        </div>
+      </div>
 
       <!-- NICKNAME MODAL -->
       <div id="nickname-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="nickname-modal-title">

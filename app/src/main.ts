@@ -1,4 +1,5 @@
 import { AudioAppInfo, isTauriRuntime, listAudioApps } from "./audio/app-audio";
+import { checkForAppUpdate, getCurrentAppVersion } from "./version-check";
 import { ConnectedViewer, ContentHintMode, HostManager, QualityPresetId } from "./webrtc/host";
 import { normalizeSignalingUrl } from "./webrtc/signaling";
 import { ViewerManager } from "./webrtc/viewer";
@@ -7,6 +8,8 @@ const SIGNALING_STORAGE_KEY = import.meta.env.DEV
   ? "screen-share.signaling-url.dev"
   : "screen-share.signaling-url";
 const NICKNAME_STORAGE_KEY = "screen-share.nickname";
+const ONBOARDING_STORAGE_KEY = "screen-share.onboarding-seen";
+const DISMISSED_UPDATE_KEY = "screen-share.dismissed-update";
 const DEFAULT_SIGNALING_URL =
   normalizeSignalingUrl(import.meta.env.VITE_SIGNALING_URL ?? "") ||
   "wss://screen-share-wfrh.onrender.com";
@@ -32,6 +35,14 @@ const nicknameForm = el<HTMLFormElement>("nickname-form");
 const nicknameInput = el<HTMLInputElement>("nickname-input");
 const nicknameError = el<HTMLElement>("nickname-error");
 const btnNicknameCancel = el<HTMLButtonElement>("btn-nickname-cancel");
+const btnOpenIntro = el<HTMLButtonElement>("btn-open-intro");
+const introModal = el<HTMLElement>("intro-modal");
+const introAppVersion = el<HTMLElement>("intro-app-version");
+const btnIntroClose = el<HTMLButtonElement>("btn-intro-close");
+const updateBanner = el<HTMLElement>("update-banner");
+const updateBannerMsg = el<HTMLElement>("update-banner-msg");
+const updateDownloadLink = el<HTMLAnchorElement>("update-download-link");
+const btnDismissUpdate = el<HTMLButtonElement>("btn-dismiss-update");
 
 // Host elements
 const hostSetup = el<HTMLElement>("host-setup");
@@ -98,6 +109,57 @@ let meterRafId: number | null = null;
 let currentRoomCode = "";
 let currentNickname = "";
 let nicknameModalRequired = false;
+let pendingOnboardingAfterNickname = false;
+let latestAvailableVersion = "";
+
+function openIntroModal(): void {
+  introModal.classList.remove("hidden");
+  window.requestAnimationFrame(() => btnIntroClose.focus());
+}
+
+function closeIntroModal(): void {
+  introModal.classList.add("hidden");
+  window.localStorage.setItem(ONBOARDING_STORAGE_KEY, "1");
+}
+
+btnOpenIntro.addEventListener("click", () => openIntroModal());
+btnIntroClose.addEventListener("click", () => closeIntroModal());
+introModal.addEventListener("click", (e) => {
+  if (e.target === introModal) {
+    closeIntroModal();
+  }
+});
+
+btnDismissUpdate.addEventListener("click", () => {
+  updateBanner.classList.add("hidden");
+  if (latestAvailableVersion) {
+    window.localStorage.setItem(DISMISSED_UPDATE_KEY, latestAvailableVersion);
+  }
+});
+
+async function runStartupVersionCheck(): Promise<void> {
+  const currentVersion = await getCurrentAppVersion();
+  introAppVersion.textContent = `v${currentVersion}`;
+
+  const update = await checkForAppUpdate(getSignalingUrl());
+  if (!update) return;
+
+  const dismissed = window.localStorage.getItem(DISMISSED_UPDATE_KEY);
+  if (dismissed === update.latestVersion) return;
+
+  latestAvailableVersion = update.latestVersion;
+  const notes = update.releaseNotes ? ` — ${update.releaseNotes}` : "";
+  updateBannerMsg.textContent = `Version v${update.latestVersion} is available (you're on v${update.currentVersion})${notes}`;
+
+  if (update.downloadUrl) {
+    updateDownloadLink.href = update.downloadUrl;
+    updateDownloadLink.classList.remove("hidden");
+  } else {
+    updateDownloadLink.classList.add("hidden");
+  }
+
+  updateBanner.classList.remove("hidden");
+}
 
 function sanitizeNickname(raw: string): string {
   return raw
@@ -154,6 +216,10 @@ nicknameForm.addEventListener("submit", (e) => {
   setNickname(cleaned);
   nicknameModalRequired = false;
   closeNicknameModal();
+  if (pendingOnboardingAfterNickname) {
+    pendingOnboardingAfterNickname = false;
+    openIntroModal();
+  }
 });
 
 // Initialize persisted signaling URL
@@ -634,6 +700,12 @@ btnFullscreen.addEventListener("click", () => void toggleFullscreen());
 viewerVideo.addEventListener("dblclick", () => void toggleFullscreen());
 
 window.addEventListener("keydown", (e) => {
+  if (!introModal.classList.contains("hidden")) {
+    if (e.key === "Escape") {
+      closeIntroModal();
+    }
+    return;
+  }
   if (!nicknameModal.classList.contains("hidden")) {
     if (e.key === "Escape" && !nicknameModalRequired) {
       closeNicknameModal();
@@ -648,13 +720,21 @@ window.addEventListener("keydown", (e) => {
   }
 });
 
-// Initialize persisted nickname (prompt on first launch)
+// Initialize persisted nickname & first-time onboarding
 const savedNickname = sanitizeNickname(window.localStorage.getItem(NICKNAME_STORAGE_KEY) ?? "");
+const onboardingSeen = window.localStorage.getItem(ONBOARDING_STORAGE_KEY) === "1";
 if (savedNickname) {
   setNickname(savedNickname);
+  if (!onboardingSeen) {
+    openIntroModal();
+  }
 } else {
+  pendingOnboardingAfterNickname = !onboardingSeen;
   openNicknameModal(true);
 }
+
+// Non-blocking startup version check against signaling server's /version endpoint
+void runStartupVersionCheck();
 
 // Initial app enumeration (in Tauri desktop runtime)
 if (isTauriRuntime()) {

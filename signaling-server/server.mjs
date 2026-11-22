@@ -8,6 +8,11 @@ const MAX_VIEWERS = 5;
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 const MAX_NICKNAME_LEN = 24;
+const LATEST_APP_VERSION = (process.env.LATEST_APP_VERSION || "0.1.0").trim();
+const APP_DOWNLOAD_URL = (
+  process.env.APP_DOWNLOAD_URL || "https://github.com/Jonsen22/screen-share/releases/latest"
+).trim();
+const APP_RELEASE_NOTES = (process.env.APP_RELEASE_NOTES || "").trim();
 
 /** @type {Map<string, { host: WebSocket, hostNickname: string, viewers: Map<string, { ws: WebSocket, nickname: string }>, createdAt: number }>} */
 const rooms = new Map();
@@ -91,6 +96,21 @@ const server = http.createServer((req, res) => {
         status: "ok",
         rooms: rooms.size,
         maxViewers: MAX_VIEWERS,
+      })
+    );
+    return;
+  }
+  if (req.url === "/version") {
+    res.writeHead(200, {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "no-store",
+    });
+    res.end(
+      JSON.stringify({
+        latestVersion: LATEST_APP_VERSION,
+        downloadUrl: APP_DOWNLOAD_URL,
+        releaseNotes: APP_RELEASE_NOTES,
       })
     );
     return;
