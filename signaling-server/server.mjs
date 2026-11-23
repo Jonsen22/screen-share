@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
+import { RateLimiter, extractClientIp } from "./rate-limiter.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "public");
@@ -19,15 +20,33 @@ const VIEWER_GRACE_MS = 30_000;
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 const MAX_NICKNAME_LEN = 24;
+const MAX_WS_PAYLOAD_BYTES = 64 * 1024; // 64 KB
 const LATEST_APP_VERSION = (process.env.LATEST_APP_VERSION || "1.2.0").trim();
 const APP_DOWNLOAD_URL = (
   process.env.APP_DOWNLOAD_URL || "https://github.com/Jonsen22/screen-share/releases/latest"
 ).trim();
 const APP_RELEASE_NOTES = (process.env.APP_RELEASE_NOTES || "").trim();
 
+const limiter = new RateLimiter({
+  maxActiveRoomsPerIp: process.env.MAX_ACTIVE_ROOMS_PER_IP,
+  maxGlobalRooms: process.env.MAX_GLOBAL_ROOMS,
+  maxRoomCreates: process.env.MAX_ROOM_CREATES,
+  roomCreateWindowMs: process.env.ROOM_CREATE_WINDOW_MS,
+  roomCreateBlockMs: process.env.ROOM_CREATE_BLOCK_MS,
+  maxFailedJoins: process.env.MAX_FAILED_JOINS,
+  failedJoinWindowMs: process.env.FAILED_JOIN_WINDOW_MS,
+  failedJoinBlockMs: process.env.FAILED_JOIN_BLOCK_MS,
+  maxWsPerIp: process.env.MAX_WS_PER_IP,
+  maxWsMessages: process.env.MAX_WS_MESSAGES,
+  wsMessageWindowMs: process.env.WS_MESSAGE_WINDOW_MS,
+  maxHttpRequests: process.env.MAX_HTTP_REQUESTS,
+  httpWindowMs: process.env.HTTP_WINDOW_MS,
+});
+
 /**
  * @typedef {{
  *   host: WebSocket | null,
+ *   hostIp: string,
  *   hostToken: string,
  *   hostNickname: string,
  *   hostGraceTimer: NodeJS.Timeout | null,
@@ -235,6 +254,17 @@ function renderWebViewerPage(code, room) {
 }
 
 const server = http.createServer((req, res) => {
+  const ip = extractClientIp(req);
+  const httpCheck = limiter.checkHttpRequest(ip);
+  if (!httpCheck.allowed) {
+    res.writeHead(429, {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Retry-After": String(httpCheck.retryAfterSec),
+    });
+    res.end("Too many requests. Please slow down.\n");
+    return;
+  }
+
   const reqPath = (req.url || "/").split("?")[0];
   if (reqPath === "/health") {
     res.writeHead(200, {
@@ -311,7 +341,37 @@ const server = http.createServer((req, res) => {
   res.end("Not found\n");
 });
 
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({
+  noServer: true,
+  maxPayload: MAX_WS_PAYLOAD_BYTES,
+});
+
+server.on("upgrade", (req, socket, head) => {
+  const ip = extractClientIp(req);
+  if (!limiter.tryAcquireWs(ip)) {
+    socket.write(
+      "HTTP/1.1 429 Too Many Requests\r\n" +
+        "Content-Type: text/plain\r\n" +
+        "Connection: close\r\n\r\n" +
+        "Too many concurrent connections from your network.\r\n"
+    );
+    socket.destroy();
+    return;
+  }
+
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    ws._clientIp = ip;
+    ws._ipReleased = false;
+    wss.emit("connection", ws, req);
+  });
+});
+
+function releaseClientIp(ws) {
+  if (!ws._ipReleased && ws._clientIp) {
+    ws._ipReleased = true;
+    limiter.releaseWs(ws._clientIp);
+  }
+}
 
 wss.on("connection", (ws) => {
   ws._isAlive = true;
@@ -323,6 +383,20 @@ wss.on("connection", (ws) => {
 
   ws.on("message", (raw) => {
     ws._isAlive = true;
+    if (!limiter.checkWsMessage(ws)) {
+      sendJson(ws, {
+        type: "error",
+        code: "RATE_LIMITED",
+        message: "Message rate limit exceeded. Disconnecting.",
+      });
+      try {
+        ws.close(1008, "Rate limit exceeded");
+      } catch {
+        ws.terminate();
+      }
+      return;
+    }
+
     let msg;
     try {
       msg = JSON.parse(raw.toString("utf8"));
@@ -338,12 +412,24 @@ wss.on("connection", (ws) => {
       }
 
       case "create_room": {
+        const ip = ws._clientIp || "unknown";
+        const check = limiter.checkCreateRoom(ip, rooms);
+        if (!check.allowed) {
+          sendJson(ws, {
+            type: "error",
+            code: check.code,
+            message: check.message,
+          });
+          return;
+        }
+
         cleanupClient(ws, true);
         const code = generateRoomCode();
         const hostToken = crypto.randomBytes(16).toString("hex");
         const hostNickname = sanitizeNickname(msg.nickname, "Host");
         rooms.set(code, {
           host: ws,
+          hostIp: ip,
           hostToken,
           hostNickname,
           hostGraceTimer: null,
@@ -398,6 +484,7 @@ wss.on("connection", (ws) => {
             }
           }
           existing.host = ws;
+          existing.hostIp = ws._clientIp || existing.hostIp;
           ws._meta = { role: "host", code, nickname: existing.hostNickname };
           sendJson(ws, {
             type: "room_reclaimed",
@@ -408,8 +495,17 @@ wss.on("connection", (ws) => {
           console.log(`[room ${code}] reclaimed by ${existing.hostNickname}`);
         } else {
           // Server restarted while host was still streaming P2P; recreate room with same code.
+          if (rooms.size >= limiter.maxGlobalRooms) {
+            sendJson(ws, {
+              type: "error",
+              code: "SERVER_BUSY",
+              message: "Server is currently at room capacity.",
+            });
+            return;
+          }
           rooms.set(code, {
             host: ws,
+            hostIp: ws._clientIp || "unknown",
             hostToken,
             hostNickname,
             hostGraceTimer: null,
@@ -470,10 +566,22 @@ wss.on("connection", (ws) => {
       }
 
       case "join_room": {
+        const ip = ws._clientIp || "unknown";
+        const joinCheck = limiter.checkJoinAllowed(ip);
+        if (!joinCheck.allowed) {
+          sendJson(ws, {
+            type: "error",
+            code: joinCheck.code,
+            message: joinCheck.message,
+          });
+          return;
+        }
+
         cleanupClient(ws, true);
         const code = normalizeCode(msg.code);
         const room = rooms.get(code);
         if (!room || !room.host) {
+          limiter.recordFailedJoin(ip);
           sendJson(ws, {
             type: "error",
             code: "ROOM_NOT_FOUND",
@@ -575,13 +683,20 @@ wss.on("connection", (ws) => {
     }
   });
 
-  ws.on("close", () => cleanupClient(ws));
-  ws.on("error", () => cleanupClient(ws));
+  ws.on("close", () => {
+    releaseClientIp(ws);
+    cleanupClient(ws);
+  });
+  ws.on("error", () => {
+    releaseClientIp(ws);
+    cleanupClient(ws);
+  });
 });
 
 const heartbeat = setInterval(() => {
   for (const ws of wss.clients) {
     if (!ws._isAlive) {
+      releaseClientIp(ws);
       cleanupClient(ws);
       ws.terminate();
       continue;
@@ -591,7 +706,10 @@ const heartbeat = setInterval(() => {
   }
 }, 25000);
 
-wss.on("close", () => clearInterval(heartbeat));
+wss.on("close", () => {
+  clearInterval(heartbeat);
+  limiter.dispose();
+});
 
 server.listen(PORT, HOST, () => {
   console.log(`screen-share signaling server listening on ws://${HOST}:${PORT}`);
