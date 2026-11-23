@@ -1,6 +1,15 @@
 import http from "node:http";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PUBLIC_DIR = path.join(__dirname, "public");
+const WEB_INDEX_HTML = fs.readFileSync(path.join(PUBLIC_DIR, "index.html"), "utf8");
+const WEB_STYLE_CSS = fs.readFileSync(path.join(PUBLIC_DIR, "style.css"), "utf8");
+const WEB_VIEWER_JS = fs.readFileSync(path.join(PUBLIC_DIR, "viewer.js"), "utf8");
 
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || "0.0.0.0";
@@ -190,90 +199,39 @@ function escapeHtml(str) {
     .replace(/'/g, "&#39;");
 }
 
-function renderJoinPage(code, room) {
-  const safeCode = escapeHtml(code);
-  const deepLink = `screenshare://join/${encodeURIComponent(code)}`;
-  const downloadUrl = escapeHtml(APP_DOWNLOAD_URL);
-  const isLive = Boolean(room && room.host);
-  const hostName = isLive ? escapeHtml(room.hostNickname || "Host") : null;
-  const title = hostName
-    ? `${hostName} is live on screen-share (${safeCode})`
-    : `Join screen-share room ${safeCode}`;
-  const subtitle = hostName
-    ? `${hostName} is streaming right now. Click below to open screen-share and join automatically.`
-    : `Open screen-share to join room ${safeCode}.`;
+function renderWebViewerPage(code, room) {
+  const isLive = Boolean(code && room && room.host);
+  const hostNickname = isLive ? room.hostNickname || "Host" : null;
+  const safeCode = code ? escapeHtml(code) : "";
+  const safeHost = hostNickname ? escapeHtml(hostNickname) : "";
 
-  return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>${title}</title>
-  <meta property="og:title" content="${title}" />
-  <meta property="og:description" content="Direct P2P Windows screen sharing with isolated per-app audio. Room code: ${safeCode}" />
-  <meta name="theme-color" content="#5865F2" />
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      min-height: 100vh; display: flex; align-items: center; justify-content: center;
-      background: #0f1116; color: #eef1f7; font-family: "Segoe UI", system-ui, sans-serif;
-      padding: 20px;
-    }
-    .card {
-      width: 100%; max-width: 440px; background: #171a22; border: 1px solid #2a3040;
-      border-radius: 12px; padding: 28px; text-align: center;
-    }
-    .badge {
-      display: inline-block; font-size: 12px; font-weight: 700; letter-spacing: .06em;
-      padding: 4px 10px; border-radius: 999px; margin-bottom: 14px;
-      background: ${isLive ? "rgba(35,165,90,.18)" : "rgba(88,101,242,.18)"};
-      color: ${isLive ? "#7df2a8" : "#9ba5ff"};
-    }
-    h1 { font-size: 20px; margin-bottom: 8px; }
-    p { color: #939db2; font-size: 14px; line-height: 1.5; margin-bottom: 20px; }
-    .code {
-      font-family: Consolas, monospace; font-size: 26px; font-weight: 700; letter-spacing: .12em;
-      background: #0f1116; border: 1px solid #2a3040; border-radius: 8px; padding: 12px;
-      margin-bottom: 18px; user-select: all;
-    }
-    .btn {
-      display: block; width: 100%; padding: 12px 16px; border-radius: 8px; border: none;
-      font-size: 14px; font-weight: 600; text-decoration: none; cursor: pointer;
-      margin-bottom: 10px;
-    }
-    .btn-primary { background: #5865f2; color: #fff; }
-    .btn-primary:hover { background: #4752c4; }
-    .btn-secondary { background: #1f2430; color: #eef1f7; border: 1px solid #2a3040; }
-    .small { font-size: 12px; color: #939db2; margin-top: 10px; }
-    .small a { color: #8c9eff; text-decoration: none; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="badge">${isLive ? "LIVE NOW" : "SCREEN-SHARE ROOM"}</div>
-    <h1>${hostName ? `${hostName} is sharing their screen` : "Join screen-share"}</h1>
-    <p>${subtitle}</p>
-    <div class="code" id="code">${safeCode}</div>
-    <a class="btn btn-primary" href="${deepLink}">Open in screen-share</a>
-    <button class="btn btn-secondary" id="copy-btn" type="button">Copy Room Code</button>
-    <div class="small">
-      Don't have the app yet? <a href="${downloadUrl}" target="_blank" rel="noopener">Download screen-share for Windows</a>
-    </div>
-  </div>
-  <script>
-    window.setTimeout(function () { window.location.href = ${JSON.stringify(deepLink)}; }, 150);
-    document.getElementById("copy-btn").addEventListener("click", function () {
-      var btn = this;
-      if (navigator.clipboard) {
-        navigator.clipboard.writeText(${JSON.stringify(code)}).then(function () {
-          btn.textContent = "Copied!";
-          setTimeout(function () { btn.textContent = "Copy Room Code"; }, 1500);
-        });
-      }
-    });
-  </script>
-</body>
-</html>`;
+  const ogTitle = code
+    ? safeHost
+      ? `${safeHost} is live on screen-share (${safeCode})`
+      : `Join screen-share room ${safeCode}`
+    : "screen-share — Watch Stream";
+  const ogDesc = code
+    ? `Watch directly in your browser (P2P WebRTC) — Room code: ${safeCode}`
+    : "Lightweight P2P WebRTC screen sharing. Watch streams directly in your browser.";
+
+  const ogMeta = [
+    `<meta property="og:title" content="${ogTitle}" />`,
+    `<meta property="og:description" content="${ogDesc}" />`,
+  ].join("\n    ");
+
+  const joinContext = {
+    code: code || null,
+    isLive,
+    hostNickname,
+    downloadUrl: APP_DOWNLOAD_URL,
+  };
+  const safeJson = JSON.stringify(joinContext).replace(/</g, "\\u003c");
+  const contextScript = `<script>window.__JOIN_CONTEXT__ = ${safeJson};</script>`;
+
+  return WEB_INDEX_HTML.replace("<!--OG_META-->", ogMeta).replace(
+    "<!--JOIN_CONTEXT-->",
+    contextScript
+  );
 }
 
 const server = http.createServer((req, res) => {
@@ -309,6 +267,30 @@ const server = http.createServer((req, res) => {
     );
     return;
   }
+  if (reqPath === "/style.css") {
+    res.writeHead(200, {
+      "Content-Type": "text/css; charset=utf-8",
+      "Cache-Control": "public, max-age=300",
+    });
+    res.end(WEB_STYLE_CSS);
+    return;
+  }
+  if (reqPath === "/viewer.js") {
+    res.writeHead(200, {
+      "Content-Type": "application/javascript; charset=utf-8",
+      "Cache-Control": "public, max-age=300",
+    });
+    res.end(WEB_VIEWER_JS);
+    return;
+  }
+  if (reqPath === "/" || reqPath === "/watch") {
+    res.writeHead(200, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
+    });
+    res.end(renderWebViewerPage(null, null));
+    return;
+  }
   if (reqPath.startsWith("/join/")) {
     const rawCode = decodeURIComponent(reqPath.slice("/join/".length));
     const code = normalizeCode(rawCode);
@@ -322,11 +304,11 @@ const server = http.createServer((req, res) => {
       "Content-Type": "text/html; charset=utf-8",
       "Cache-Control": "no-store",
     });
-    res.end(renderJoinPage(code, room));
+    res.end(renderWebViewerPage(code, room));
     return;
   }
-  res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("screen-share signaling server\n");
+  res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+  res.end("Not found\n");
 });
 
 const wss = new WebSocketServer({ server });

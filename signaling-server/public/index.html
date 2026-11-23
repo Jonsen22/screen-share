@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>screen-share — Watch Stream</title>
+    <!--OG_META-->
+    <meta name="theme-color" content="#5865F2" />
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <div id="app" class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-dot" aria-hidden="true"></span>
+          <span class="brand-name">screen-share</span>
+          <span class="brand-tag">Web Viewer · P2P</span>
+        </div>
+
+        <div class="topbar-right">
+          <a
+            id="download-desktop-link"
+            class="btn btn-ghost btn-sm"
+            href="https://github.com/Jonsen22/screen-share/releases/latest"
+            target="_blank"
+            rel="noopener"
+          >
+            Want to host? Get Windows App
+          </a>
+        </div>
+      </header>
+
+      <main class="main-content">
+        <!-- JOIN CARD -->
+        <section id="viewer-join" class="panel setup-panel">
+          <div class="panel-head">
+            <span id="live-status-badge" class="status-badge hidden">LIVE NOW</span>
+            <h1 id="join-title">Watch a Stream</h1>
+            <p id="join-subtitle" class="muted">
+              Enter your nickname and the 8-character room code from the host to watch directly in your browser.
+            </p>
+          </div>
+
+          <form id="viewer-join-form" class="join-form">
+            <div class="field">
+              <label for="nickname-input">Your Nickname</label>
+              <input
+                id="nickname-input"
+                type="text"
+                maxlength="24"
+                autocomplete="nickname"
+                spellcheck="false"
+                placeholder="Enter your nickname"
+                required
+              />
+            </div>
+
+            <div class="field">
+              <label for="room-code-input">Room Code</label>
+              <input
+                id="room-code-input"
+                class="code-input"
+                type="text"
+                maxlength="9"
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="ABCD-1234"
+                required
+              />
+            </div>
+
+            <div class="privacy-notice" role="note">
+              <strong>P2P Privacy Notice:</strong> Video and audio stream directly between peers (DTLS-SRTP encrypted). Peers in the same room can see each other's public IP address — only join rooms from people you trust.
+            </div>
+
+            <div id="viewer-error" class="alert alert-error hidden"></div>
+
+            <div class="actions-stack">
+              <button id="btn-join-room" class="btn btn-primary btn-lg full-width" type="submit">
+                Watch in Browser
+              </button>
+              <a
+                id="btn-open-desktop"
+                class="btn btn-secondary full-width hidden"
+                href="#"
+              >
+                Open in Desktop App
+              </a>
+            </div>
+          </form>
+        </section>
+
+        <!-- WATCHING STAGE -->
+        <section id="viewer-stage" class="viewer-stage hidden">
+          <div id="viewer-video-wrap" class="stage-card viewer-video-card">
+            <video id="viewer-video" class="video-surface" autoplay playsinline></video>
+
+            <div id="viewer-banner" class="center-banner hidden">
+              <span id="viewer-banner-text">Connecting to host...</span>
+            </div>
+
+            <button id="btn-unmute-overlay" class="unmute-overlay hidden" type="button">
+              Click to Unmute Stream Audio
+            </button>
+
+            <div id="stats-hud" class="stats-hud hidden">
+              <div class="stats-title">Stream Telemetry</div>
+              <dl class="stats-grid">
+                <dt>Resolution</dt><dd id="stat-res">-</dd>
+                <dt>FPS</dt><dd id="stat-fps">-</dd>
+                <dt>Video</dt><dd id="stat-bitrate">-</dd>
+                <dt>Audio</dt><dd id="stat-audio">-</dd>
+                <dt>Latency (RTT)</dt><dd id="stat-rtt">-</dd>
+                <dt>Packet Loss</dt><dd id="stat-loss">-</dd>
+                <dt>Codec</dt><dd id="stat-codec">-</dd>
+                <dt>State</dt><dd id="stat-state">-</dd>
+              </dl>
+            </div>
+
+            <div class="viewer-controls">
+              <div class="controls-left">
+                <span id="viewer-room-badge" class="meta-pill">----</span>
+                <button id="btn-viewer-mute" class="btn btn-ghost btn-sm" type="button">
+                  Mute
+                </button>
+                <input
+                  id="viewer-volume"
+                  class="volume-slider"
+                  type="range"
+                  min="0"
+                  max="1"
+                  step="0.02"
+                  value="1"
+                  aria-label="Volume"
+                />
+              </div>
+              <div class="controls-right">
+                <button id="btn-toggle-stats" class="btn btn-ghost btn-sm" type="button">
+                  Stats (I)
+                </button>
+                <button id="btn-fullscreen" class="btn btn-ghost btn-sm" type="button">
+                  Fullscreen (F)
+                </button>
+                <button id="btn-leave-room" class="btn btn-danger btn-sm" type="button">
+                  Leave
+                </button>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <!--JOIN_CONTEXT-->
+    <script type="module" src="/viewer.js"></script>
+  </body>
+</html>
