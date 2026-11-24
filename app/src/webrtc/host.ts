@@ -1,27 +1,18 @@
-import { AppAudioBridge, AudioBridgeStatus, AudioCaptureTarget } from "../audio/app-audio";
-import { SignalingClient, ServerMessage, signalingUrlToHealthUrl } from "./signaling";
+import { AudioBridgeStatus, AudioCaptureTarget } from "../audio/app-audio";
+import {
+  ContentHintMode,
+  QualityPresetId,
+  StreamPublisher,
+} from "./publisher";
+import {
+  ActiveStreamInfo,
+  ServerMessage,
+  SignalingClient,
+  signalingUrlToHealthUrl,
+} from "./signaling";
+import { StreamSubscriber } from "./subscriber";
 
-export type QualityPresetId = "720p30" | "1080p30" | "1080p60" | "source60";
-export type ContentHintMode = "motion" | "detail";
-
-interface PresetConfig {
-  width?: number;
-  height?: number;
-  frameRate: number;
-  maxBitrate: number;
-}
-
-const PRESETS: Record<QualityPresetId, PresetConfig> = {
-  "720p30": { width: 1280, height: 720, frameRate: 30, maxBitrate: 2_500_000 },
-  "1080p30": { width: 1920, height: 1080, frameRate: 30, maxBitrate: 4_500_000 },
-  "1080p60": { width: 1920, height: 1080, frameRate: 60, maxBitrate: 8_000_000 },
-  source60: { frameRate: 60, maxBitrate: 10_000_000 },
-};
-
-const ICE_SERVERS: RTCIceServer[] = [
-  { urls: "stun:stun.l.google.com:19302" },
-  { urls: "stun:stun1.l.google.com:19302" },
-];
+export type { ContentHintMode, QualityPresetId } from "./publisher";
 
 const RENDER_KEEPALIVE_MS = 10 * 60 * 1000; // 10 min (prevents 15-min Render free-tier sleep)
 
@@ -42,66 +33,20 @@ export interface HostCallbacks {
   onRoomCreated: (code: string, maxViewers: number, previewStream: MediaStream) => void;
   onStreamChanged: (previewStream: MediaStream) => void;
   onViewersChange: (viewers: ConnectedViewer[], maxViewers: number) => void;
+  onActiveStreamsChange?: (streams: ActiveStreamInfo[], watchedStreamerId: string | null) => void;
+  onRemoteStream?: (stream: MediaStream | null, streamer: ActiveStreamInfo | null) => void;
+  onRemoteBanner?: (text: string | null) => void;
   onSignalingStatus?: (status: "connected" | "reconnecting") => void;
   onEnded: (reason?: string) => void;
   onError: (message: string) => void;
 }
 
-interface ViewerPeer {
-  id: string;
-  nickname: string;
-  pc: RTCPeerConnection;
-  videoSender: RTCRtpSender | null;
-  pendingIce: RTCIceCandidateInit[];
-  remoteSet: boolean;
-}
-
-function preferStereoOpus(sdp: string): string {
-  const lines = sdp.split("\r\n");
-  let opusPayload: string | null = null;
-  for (const line of lines) {
-    const m = /^a=rtpmap:(\d+)\s+opus\/48000\/2/i.exec(line);
-    if (m) {
-      opusPayload = m[1];
-      break;
-    }
-  }
-  if (!opusPayload) return sdp;
-
-  const fmtpPrefix = `a=fmtp:${opusPayload} `;
-  let foundFmtp = false;
-  const updated = lines.map((line) => {
-    if (!line.startsWith(fmtpPrefix)) return line;
-    foundFmtp = true;
-    let next = line;
-    if (!next.includes("stereo=1")) next += ";stereo=1";
-    if (!next.includes("sprop-stereo=1")) next += ";sprop-stereo=1";
-    if (!next.includes("maxaveragebitrate=")) next += ";maxaveragebitrate=128000";
-    return next;
-  });
-
-  if (!foundFmtp) {
-    const idx = updated.findIndex((l) => l.startsWith(`a=rtpmap:${opusPayload} `));
-    if (idx >= 0) {
-      updated.splice(
-        idx + 1,
-        0,
-        `a=fmtp:${opusPayload} minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1;maxaveragebitrate=128000`
-      );
-    }
-  }
-  return updated.join("\r\n");
-}
-
 export class HostManager {
   private signaling = new SignalingClient();
-  private audioBridge = new AppAudioBridge();
-  private videoStream: MediaStream | null = null;
-  private outboundStream: MediaStream | null = null;
-  private videoEndedHandler: (() => void) | null = null;
-  private peers = new Map<string, ViewerPeer>();
-  private preset: PresetConfig = PRESETS["1080p30"];
-  private contentHint: ContentHintMode = "motion";
+  private publisher: StreamPublisher;
+  private subscriber: StreamSubscriber;
+  private connectedViewers = new Map<string, ConnectedViewer>();
+  private activeStreams = new Map<string, ActiveStreamInfo>();
   private signalingUrl = "";
   private hostNickname = "Host";
   private roomCode = "";
@@ -115,137 +60,140 @@ export class HostManager {
 
   constructor(callbacks: HostCallbacks) {
     this.callbacks = callbacks;
-  }
 
-  private buildVideoConstraints(): MediaTrackConstraints {
-    const constraints: MediaTrackConstraints = {
-      frameRate: { ideal: this.preset.frameRate, max: this.preset.frameRate },
-    };
-    if (this.preset.width && this.preset.height) {
-      constraints.width = { ideal: this.preset.width, max: this.preset.width };
-      constraints.height = { ideal: this.preset.height, max: this.preset.height };
-    }
-    return constraints;
-  }
+    this.publisher = new StreamPublisher(this.signaling, {
+      onStreamChanged: (stream) => this.callbacks.onStreamChanged(stream),
+      onUnexpectedTrackEnded: () => {
+        if (this.active) {
+          void this.stop("Screen sharing ended from system controls.");
+        }
+      },
+      onError: (msg) => this.callbacks.onError(msg),
+    });
+    this.publisher.setSelfId("host");
 
-  private attachVideoEndedHandler(track: MediaStreamTrack): void {
-    const handler = () => {
-      if (this.active && this.videoStream?.getVideoTracks()[0] === track) {
-        void this.stop("Screen sharing ended from system controls.");
-      }
-    };
-    this.videoEndedHandler = handler;
-    track.addEventListener("ended", handler);
-  }
-
-  private detachVideoEndedHandler(track: MediaStreamTrack | undefined): void {
-    if (track && this.videoEndedHandler) {
-      track.removeEventListener("ended", this.videoEndedHandler);
-    }
-    this.videoEndedHandler = null;
+    this.subscriber = new StreamSubscriber(this.signaling, {
+      onStream: (stream) => {
+        const watchedId = this.subscriber.getWatchedStreamerId();
+        const info = watchedId ? this.activeStreams.get(watchedId) ?? null : null;
+        this.callbacks.onRemoteStream?.(stream, info);
+      },
+      onBanner: (text) => this.callbacks.onRemoteBanner?.(text),
+    });
   }
 
   async start(options: HostStartOptions): Promise<void> {
     if (this.active) return;
 
-    this.preset = PRESETS[options.preset];
-    this.contentHint = options.contentHint;
     this.signalingUrl = options.signalingUrl;
     this.hostNickname = options.nickname;
 
-    // Initialize AudioContext BEFORE opening the async screen picker so it stays
-    // unlocked by the user's click gesture in Chromium/WebView2.
-    const audioTrack = await this.audioBridge.init();
-
-    // Always capture video with audio: false so system audio is never leaked
-    let videoStream: MediaStream;
-    try {
-      videoStream = await navigator.mediaDevices.getDisplayMedia({
-        video: this.buildVideoConstraints(),
-        audio: false,
-      });
-    } catch (err) {
-      await this.audioBridge.dispose();
-      const name = err instanceof DOMException ? err.name : "";
-      if (name === "NotAllowedError" || name === "AbortError") {
-        throw new Error("Screen capture was cancelled.");
-      }
-      throw new Error(`Failed to capture screen: ${String(err)}`);
-    }
-
-    const videoTrack = videoStream.getVideoTracks()[0];
-    if (!videoTrack) {
-      videoStream.getTracks().forEach((t) => t.stop());
-      await this.audioBridge.dispose();
-      throw new Error("No video track returned by screen picker.");
-    }
-
-    if ("contentHint" in videoTrack) {
-      videoTrack.contentHint = options.contentHint;
-    }
-
-    this.videoStream = videoStream;
+    const previewStream = await this.publisher.start({
+      preset: options.preset,
+      contentHint: options.contentHint,
+      audioTarget: options.audioTarget,
+    });
 
     try {
-      await this.audioBridge.ensureRunning();
-      if (options.audioTarget.kind !== "none") {
-        await this.audioBridge.setTarget(options.audioTarget);
-      }
-
-      this.outboundStream = new MediaStream([videoTrack, audioTrack]);
-
       await this.signaling.connect(options.signalingUrl);
 
-      const roomInfo = await new Promise<{ code: string; hostToken: string; maxViewers: number }>(
-        (resolve, reject) => {
-          const timer = window.setTimeout(() => {
+      const roomInfo = await new Promise<{
+        code: string;
+        hostToken: string;
+        maxViewers: number;
+        activeStreams: ActiveStreamInfo[];
+      }>((resolve, reject) => {
+        const timer = window.setTimeout(() => {
+          unsub();
+          reject(new Error("Timed out waiting for room creation."));
+        }, 8000);
+
+        const unsub = this.signaling.onMessage((msg) => {
+          if (msg.type === "room_created") {
+            window.clearTimeout(timer);
             unsub();
-            reject(new Error("Timed out waiting for room creation."));
-          }, 8000);
+            resolve({
+              code: msg.code,
+              hostToken: msg.hostToken || "",
+              maxViewers: msg.maxViewers,
+              activeStreams: msg.activeStreams || [
+                { streamerId: "host", nickname: options.nickname },
+              ],
+            });
+          } else if (msg.type === "error") {
+            window.clearTimeout(timer);
+            unsub();
+            reject(new Error(msg.message));
+          }
+        });
 
-          const unsub = this.signaling.onMessage((msg) => {
-            if (msg.type === "room_created") {
-              window.clearTimeout(timer);
-              unsub();
-              resolve({
-                code: msg.code,
-                hostToken: msg.hostToken || "",
-                maxViewers: msg.maxViewers,
-              });
-            } else if (msg.type === "error") {
-              window.clearTimeout(timer);
-              unsub();
-              reject(new Error(msg.message));
-            }
-          });
-
-          this.signaling.send({ type: "create_room", nickname: options.nickname });
-        }
-      );
+        this.signaling.send({ type: "create_room", nickname: options.nickname });
+      });
 
       this.active = true;
       this.roomCode = roomInfo.code;
       this.hostToken = roomInfo.hostToken;
       this.maxViewers = roomInfo.maxViewers;
+      this.connectedViewers.clear();
+      this.syncActiveStreams(roomInfo.activeStreams);
 
       this.signaling.onMessage((msg) => this.handleServerMessage(msg));
       this.signaling.onClose(() => {
         if (this.active) {
-          // Keep live P2P streams running! Reconnect signaling in the background.
           this.scheduleSignalingReconnect();
         }
       });
 
       this.startHealthKeepalive();
-      this.attachVideoEndedHandler(videoTrack);
 
-      this.callbacks.onRoomCreated(roomInfo.code, roomInfo.maxViewers, videoStream);
+      this.callbacks.onRoomCreated(roomInfo.code, roomInfo.maxViewers, previewStream);
       this.callbacks.onSignalingStatus?.("connected");
       this.emitViewersChange();
+      this.emitActiveStreamsChange();
     } catch (err) {
       await this.cleanup();
       throw err;
     }
+  }
+
+  private syncActiveStreams(list: ActiveStreamInfo[] | undefined): void {
+    this.activeStreams.clear();
+    if (list && list.length > 0) {
+      for (const s of list) {
+        this.activeStreams.set(s.streamerId, s);
+      }
+    } else if (this.active) {
+      this.activeStreams.set("host", { streamerId: "host", nickname: this.hostNickname });
+    }
+  }
+
+  private emitActiveStreamsChange(): void {
+    this.callbacks.onActiveStreamsChange?.(
+      Array.from(this.activeStreams.values()),
+      this.subscriber.getWatchedStreamerId()
+    );
+  }
+
+  watchStream(streamerId: string): void {
+    if (!this.active) return;
+    if (streamerId === "host") {
+      this.stopWatching(true);
+      return;
+    }
+    const info = this.activeStreams.get(streamerId);
+    if (!info) return;
+    this.subscriber.watch(streamerId, info.nickname);
+    this.emitActiveStreamsChange();
+  }
+
+  stopWatching(notifyServer = true): void {
+    this.subscriber.stopWatching(notifyServer);
+    this.callbacks.onRemoteBanner?.(null);
+    this.emitActiveStreamsChange();
+  }
+
+  getWatchedStreamerId(): string | null {
+    return this.subscriber.getWatchedStreamerId();
   }
 
   private startHealthKeepalive(): void {
@@ -289,6 +237,7 @@ export class HostManager {
             code: this.roomCode,
             hostToken: this.hostToken,
             nickname: this.hostNickname,
+            isStreaming: this.publisher.isActive(),
           });
         }
         this.reconnecting = false;
@@ -310,148 +259,46 @@ export class HostManager {
     }, delayMs);
   }
 
-  /**
-   * Opens the Windows screen/window picker and seamlessly swaps the outgoing
-   * video track on all connected viewers via RTCRtpSender.replaceTrack()
-   * without closing or reconnecting the room.
-   * Returns true if switched, false if the user cancelled the picker.
-   */
   async switchScreen(): Promise<boolean> {
     if (!this.active) return false;
-
-    let nextStream: MediaStream;
-    try {
-      nextStream = await navigator.mediaDevices.getDisplayMedia({
-        video: this.buildVideoConstraints(),
-        audio: false,
-      });
-    } catch (err) {
-      const name = err instanceof DOMException ? err.name : "";
-      if (name === "NotAllowedError" || name === "AbortError") {
-        // User cancelled picker — keep existing stream running untouched
-        return false;
-      }
-      throw new Error(`Failed to switch screen: ${String(err)}`);
-    }
-
-    const nextTrack = nextStream.getVideoTracks()[0];
-    if (!nextTrack) {
-      nextStream.getTracks().forEach((t) => t.stop());
-      throw new Error("No video track returned by screen picker.");
-    }
-
-    if ("contentHint" in nextTrack) {
-      nextTrack.contentHint = this.contentHint;
-    }
-
-    const prevStream = this.videoStream;
-    const prevTrack = prevStream?.getVideoTracks()[0];
-
-    // Swap track on all active viewer peer connections seamlessly
-    const replaceTasks: Promise<void>[] = [];
-    for (const peer of this.peers.values()) {
-      if (peer.videoSender) {
-        const sender = peer.videoSender;
-        replaceTasks.push(
-          sender.replaceTrack(nextTrack).then(() => this.configureSender(sender, "video"))
-        );
-      }
-    }
-    await Promise.all(replaceTasks);
-
-    // Update outboundStream so any future viewers joining receive the new track
-    if (this.outboundStream) {
-      for (const oldTrack of this.outboundStream.getVideoTracks()) {
-        this.outboundStream.removeTrack(oldTrack);
-      }
-      this.outboundStream.addTrack(nextTrack);
-    }
-
-    // Detach old ended handler BEFORE stopping old track so room stays open
-    this.detachVideoEndedHandler(prevTrack);
-    if (prevStream) {
-      for (const t of prevStream.getTracks()) {
-        t.stop();
-      }
-    }
-
-    this.videoStream = nextStream;
-    this.attachVideoEndedHandler(nextTrack);
-    this.callbacks.onStreamChanged(nextStream);
-    return true;
+    return this.publisher.switchScreen();
   }
 
-  /**
-   * Live-updates quality preset (bitrate/framerate/resolution constraints) and
-   * encoding contentHint for all connected viewers without interrupting the room.
-   */
   async updateQuality(presetId: QualityPresetId, contentHint: ContentHintMode): Promise<void> {
-    this.preset = PRESETS[presetId];
-    this.contentHint = contentHint;
-
-    if (!this.active) return;
-
-    const videoTrack = this.videoStream?.getVideoTracks()[0];
-    if (videoTrack) {
-      if ("contentHint" in videoTrack) {
-        videoTrack.contentHint = contentHint;
-      }
-      try {
-        await videoTrack.applyConstraints(this.buildVideoConstraints());
-      } catch {
-        // Some capture sources only apply new resolution constraints on next picker switch
-      }
-    }
-
-    const tasks: Promise<void>[] = [];
-    for (const peer of this.peers.values()) {
-      if (peer.videoSender) {
-        tasks.push(this.configureSender(peer.videoSender, "video"));
-      }
-    }
-    await Promise.all(tasks);
+    await this.publisher.updateQuality(presetId, contentHint);
   }
 
   async switchAudioTarget(target: AudioCaptureTarget): Promise<void> {
     if (!this.active) return;
-    await this.audioBridge.setTarget(target);
+    await this.publisher.switchAudioTarget(target);
   }
 
   setAudioMuted(muted: boolean): void {
-    this.audioBridge.setMuted(muted);
+    this.publisher.setAudioMuted(muted);
   }
 
   isAudioMuted(): boolean {
-    return this.audioBridge.isMuted();
+    return this.publisher.isAudioMuted();
   }
 
   setMonitorLocally(enabled: boolean): void {
-    this.audioBridge.setMonitorLocally(enabled);
+    this.publisher.setMonitorLocally(enabled);
   }
 
   isMonitoringLocally(): boolean {
-    return this.audioBridge.isMonitoringLocally();
+    return this.publisher.isMonitoringLocally();
   }
 
   getAudioStatus(): AudioBridgeStatus {
-    return this.audioBridge.getStatus();
+    return this.publisher.getAudioStatus();
   }
 
   getAudioLevel(): number {
-    return this.audioBridge.getLevel();
+    return this.publisher.getAudioLevel();
   }
 
   getVideoMeta(): string {
-    const track = this.videoStream?.getVideoTracks()[0];
-    if (!track) return "No video";
-    const s = track.getSettings();
-    const w = s.width ?? 0;
-    const h = s.height ?? 0;
-    const fps = s.frameRate ? Math.round(s.frameRate) : this.preset.frameRate;
-    if (w && h) {
-      return `${w}×${h} · ${fps} fps`;
-    }
-    return `${fps} fps`;
+    return this.publisher.getVideoMeta();
   }
 
   async stop(reason?: string): Promise<void> {
@@ -474,206 +321,124 @@ export class HostManager {
     }
     this.stopHealthKeepalive();
 
-    for (const peer of this.peers.values()) {
-      peer.pc.close();
-    }
-    this.peers.clear();
-
+    this.subscriber.stopWatching(false);
+    await this.publisher.stop();
+    this.connectedViewers.clear();
+    this.activeStreams.clear();
     this.signaling.close();
-    await this.audioBridge.dispose();
 
-    const track = this.videoStream?.getVideoTracks()[0];
-    this.detachVideoEndedHandler(track);
-
-    if (this.videoStream) {
-      for (const t of this.videoStream.getTracks()) {
-        t.stop();
-      }
-      this.videoStream = null;
-    }
-    this.outboundStream = null;
     this.roomCode = "";
     this.hostToken = "";
   }
 
   kickViewer(viewerId: string): void {
     if (!this.active) return;
-    if (!this.peers.has(viewerId)) return;
+    if (!this.connectedViewers.has(viewerId)) return;
     try {
       this.signaling.send({ type: "kick_viewer", targetId: viewerId });
     } catch {
       // Ignore if socket already closed
     }
-    this.removePeer(viewerId);
+    this.connectedViewers.delete(viewerId);
+    this.publisher.removeWatcher(viewerId);
+    if (this.subscriber.getWatchedStreamerId() === viewerId) {
+      this.stopWatching(false);
+    }
     this.emitViewersChange();
   }
 
   banViewer(viewerId: string): void {
     if (!this.active) return;
-    if (!this.peers.has(viewerId)) return;
+    if (!this.connectedViewers.has(viewerId)) return;
     try {
       this.signaling.send({ type: "ban_viewer", targetId: viewerId });
     } catch {
       // Ignore if socket already closed
     }
-    this.removePeer(viewerId);
+    this.connectedViewers.delete(viewerId);
+    this.publisher.removeWatcher(viewerId);
+    if (this.subscriber.getWatchedStreamerId() === viewerId) {
+      this.stopWatching(false);
+    }
     this.emitViewersChange();
   }
 
   private emitViewersChange(): void {
-    const viewers: ConnectedViewer[] = Array.from(this.peers.values()).map((peer) => ({
-      id: peer.id,
-      nickname: peer.nickname,
-    }));
-    this.callbacks.onViewersChange(viewers, this.maxViewers);
+    this.callbacks.onViewersChange(
+      Array.from(this.connectedViewers.values()),
+      this.maxViewers
+    );
   }
 
   private handleServerMessage(msg: ServerMessage): void {
     switch (msg.type) {
       case "room_reclaimed":
         this.callbacks.onSignalingStatus?.("connected");
+        this.syncActiveStreams(msg.activeStreams);
+        if (
+          this.subscriber.getWatchedStreamerId() &&
+          !this.activeStreams.has(this.subscriber.getWatchedStreamerId()!)
+        ) {
+          this.stopWatching(false);
+        }
         this.emitViewersChange();
+        this.emitActiveStreamsChange();
         break;
 
       case "viewer_joined":
-        void this.createPeerForViewer(msg.viewerId, msg.nickname || "Viewer");
+        this.connectedViewers.set(msg.viewerId, {
+          id: msg.viewerId,
+          nickname: msg.nickname || "Viewer",
+        });
+        this.emitViewersChange();
         break;
 
       case "viewer_left":
+        this.connectedViewers.delete(msg.viewerId);
         if (msg.explicit || msg.kicked || msg.banned) {
-          this.removePeer(msg.viewerId);
-          this.emitViewersChange();
+          this.publisher.removeWatcher(msg.viewerId);
+        }
+        this.emitViewersChange();
+        break;
+
+      case "viewer_watching":
+        void this.publisher.addWatcher(msg.viewerId, msg.nickname || "Viewer");
+        break;
+
+      case "viewer_unwatching":
+        this.publisher.removeWatcher(msg.viewerId);
+        break;
+
+      case "stream_started":
+        this.activeStreams.set(msg.streamerId, {
+          streamerId: msg.streamerId,
+          nickname: msg.nickname,
+        });
+        this.emitActiveStreamsChange();
+        break;
+
+      case "stream_stopped":
+        this.activeStreams.delete(msg.streamerId);
+        if (this.subscriber.getWatchedStreamerId() === msg.streamerId) {
+          this.stopWatching(false);
+        } else {
+          this.emitActiveStreamsChange();
         }
         break;
 
-      case "signal":
-        void this.handleSignal(msg.fromId, msg.payload);
+      case "signal": {
+        const streamId = msg.streamId || "host";
+        if (streamId === "host") {
+          void this.publisher.handleSignal(msg.fromId, msg.payload);
+        } else if (streamId === this.subscriber.getWatchedStreamerId()) {
+          void this.subscriber.handleSignal(msg.fromId, msg.payload);
+        }
         break;
+      }
 
       case "error":
         this.callbacks.onError(msg.message);
         break;
-    }
-  }
-
-  private async createPeerForViewer(viewerId: string, nickname: string): Promise<void> {
-    if (!this.outboundStream) return;
-    this.removePeer(viewerId);
-
-    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-    const entry: ViewerPeer = {
-      id: viewerId,
-      nickname,
-      pc,
-      videoSender: null,
-      pendingIce: [],
-      remoteSet: false,
-    };
-    this.peers.set(viewerId, entry);
-    this.emitViewersChange();
-
-    for (const track of this.outboundStream.getTracks()) {
-      const sender = pc.addTrack(track, this.outboundStream);
-      if (track.kind === "video") {
-        entry.videoSender = sender;
-      }
-      void this.configureSender(sender, track.kind);
-    }
-
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        try {
-          this.signaling.send({
-            type: "signal",
-            targetId: viewerId,
-            payload: { kind: "ice", candidate: event.candidate.toJSON() },
-          });
-        } catch {
-          // Ignore send failure during teardown
-        }
-      }
-    };
-
-    pc.onconnectionstatechange = () => {
-      if (pc.connectionState === "failed" || pc.connectionState === "closed") {
-        this.removePeer(viewerId);
-        this.emitViewersChange();
-      }
-    };
-
-    try {
-      const offer = await pc.createOffer();
-      if (offer.sdp) {
-        offer.sdp = preferStereoOpus(offer.sdp);
-      }
-      await pc.setLocalDescription(offer);
-      this.signaling.send({
-        type: "signal",
-        targetId: viewerId,
-        payload: { kind: "offer", sdp: pc.localDescription! },
-      });
-    } catch (err) {
-      this.callbacks.onError(`Failed to negotiate with viewer ${nickname}: ${String(err)}`);
-      this.removePeer(viewerId);
-      this.emitViewersChange();
-    }
-  }
-
-  private async configureSender(sender: RTCRtpSender, kind: string): Promise<void> {
-    try {
-      const params = sender.getParameters();
-      if (!params.encodings || params.encodings.length === 0) {
-        params.encodings = [{}];
-      }
-      if (kind === "video") {
-        params.encodings[0].maxBitrate = this.preset.maxBitrate;
-        params.encodings[0].maxFramerate = this.preset.frameRate;
-        params.degradationPreference =
-          this.contentHint === "detail" ? "maintain-resolution" : "maintain-framerate";
-      } else if (kind === "audio") {
-        params.encodings[0].maxBitrate = 128_000;
-      }
-      await sender.setParameters(params);
-    } catch {
-      // Some WebView implementations ignore optional RTP params
-    }
-  }
-
-  private async handleSignal(
-    viewerId: string,
-    payload: Extract<ServerMessage, { type: "signal" }>["payload"]
-  ): Promise<void> {
-    const entry = this.peers.get(viewerId);
-    if (!entry) return;
-
-    try {
-      if (payload.kind === "answer") {
-        await entry.pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
-        entry.remoteSet = true;
-        for (const cand of entry.pendingIce) {
-          await entry.pc.addIceCandidate(new RTCIceCandidate(cand));
-        }
-        entry.pendingIce = [];
-      } else if (payload.kind === "ice") {
-        if (entry.remoteSet) {
-          await entry.pc.addIceCandidate(new RTCIceCandidate(payload.candidate));
-        } else {
-          entry.pendingIce.push(payload.candidate);
-        }
-      }
-    } catch (err) {
-      this.callbacks.onError(`Signaling error for viewer ${viewerId}: ${String(err)}`);
-    }
-  }
-
-  private removePeer(viewerId: string): void {
-    const entry = this.peers.get(viewerId);
-    if (!entry) return;
-    this.peers.delete(viewerId);
-    try {
-      entry.pc.close();
-    } catch {
-      // Ignore
     }
   }
 }

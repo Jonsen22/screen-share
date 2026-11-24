@@ -147,13 +147,51 @@
 
           <!-- Host Live Stage -->
           <div id="host-live" class="live-layout hidden">
-            <div class="stage-card">
-              <div class="stage-overlay-top">
-                <span class="live-pill"><span class="live-dot"></span>LIVE</span>
-                <span id="host-video-meta" class="meta-pill">Connecting...</span>
-                <span id="host-viewer-pill" class="meta-pill">0 / 5 Viewers</span>
+            <div class="stage-column">
+              <div id="host-streams-bar" class="streams-bar">
+                <div class="streams-bar-left">
+                  <span class="streams-label">ACTIVE STREAMS</span>
+                  <div id="host-streams-list" class="streams-list" role="tablist" aria-label="Active Streams"></div>
+                </div>
               </div>
-              <video id="host-preview" class="video-surface" autoplay muted playsinline></video>
+
+              <div class="stage-card">
+                <div class="stage-overlay-top">
+                  <span class="live-pill"><span class="live-dot"></span>LIVE</span>
+                  <span id="host-video-meta" class="meta-pill">Connecting...</span>
+                  <span id="host-viewer-pill" class="meta-pill">0 / 5 Viewers</span>
+                </div>
+                <video id="host-preview" class="video-surface" autoplay muted playsinline></video>
+                <video id="host-remote-video" class="video-surface hidden" autoplay playsinline></video>
+
+                <div id="host-remote-banner" class="center-banner hidden">
+                  <span id="host-remote-banner-text">Connecting...</span>
+                </div>
+
+                <div id="host-remote-controls" class="viewer-controls hidden">
+                  <div class="controls-left">
+                    <span id="host-remote-badge" class="meta-pill">Watching co-streamer</span>
+                    <button id="btn-host-remote-mute" class="btn btn-ghost btn-sm" type="button">
+                      Mute
+                    </button>
+                    <input
+                      id="host-remote-volume"
+                      class="volume-slider"
+                      type="range"
+                      min="0"
+                      max="1"
+                      step="0.02"
+                      value="1"
+                      aria-label="Co-streamer Volume"
+                    />
+                  </div>
+                  <div class="controls-right">
+                    <button id="btn-host-back-preview" class="btn btn-secondary btn-sm" type="button">
+                      Back to My Preview
+                    </button>
+                  </div>
+                </div>
+              </div>
             </div>
 
             <aside class="sidebar-card">
@@ -308,8 +346,30 @@
 
           <!-- Viewer Watching Stage -->
           <div id="viewer-stage" class="viewer-stage hidden">
+            <div id="viewer-streams-bar" class="streams-bar">
+              <div class="streams-bar-left">
+                <span class="streams-label">ACTIVE STREAMS</span>
+                <div id="viewer-streams-list" class="streams-list" role="tablist" aria-label="Active Streams"></div>
+              </div>
+              <div class="streams-bar-actions">
+                <div id="viewer-share-controls" class="viewer-share-controls hidden">
+                  <span class="live-pill"><span class="live-dot"></span>SHARING</span>
+                  <button id="btn-viewer-switch-screen" class="btn btn-secondary btn-sm" type="button">
+                    Change Screen
+                  </button>
+                  <button id="btn-viewer-share-mute" class="btn btn-ghost btn-sm" type="button">
+                    Mute Shared Audio
+                  </button>
+                </div>
+                <button id="btn-viewer-share" class="btn btn-primary btn-sm" type="button">
+                  Share My Screen
+                </button>
+              </div>
+            </div>
+
             <div id="viewer-video-wrap" class="stage-card viewer-video-card">
               <video id="viewer-video" class="video-surface" autoplay playsinline></video>
+              <video id="viewer-local-preview" class="video-surface hidden" autoplay muted playsinline></video>
 
               <div id="viewer-banner" class="center-banner hidden">
                 <span id="viewer-banner-text">Connecting to host...</span>
@@ -489,6 +549,63 @@
               Ban Viewer
             </button>
           </div>
+        </div>
+      </div>
+
+      <!-- CO-STREAM SHARE MODAL (VIEWER SHARING IN ROOM) -->
+      <div id="costream-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="costream-modal-title">
+        <div class="modal-card modal-card-wide">
+          <h2 id="costream-modal-title">Share Your Screen in This Room</h2>
+          <p class="muted small">
+            Start sharing your screen alongside the room host. Others in the room can click your stream pill to watch you live.
+          </p>
+          <form id="costream-form" class="modal-form">
+            <div class="form-grid">
+              <div class="field">
+                <label for="costream-preset-select">Quality Preset</label>
+                <select id="costream-preset-select">
+                  <option value="720p30">720p · 30 fps (2.5 Mbps)</option>
+                  <option value="1080p30" selected>1080p · 30 fps (4.5 Mbps)</option>
+                  <option value="1080p60">1080p · 60 fps (8.0 Mbps)</option>
+                  <option value="source60">Native Source · 60 fps (10.0 Mbps)</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="costream-hint-select">Encoding Priority</label>
+                <select id="costream-hint-select">
+                  <option value="motion" selected>Smooth Motion (Games / Video)</option>
+                  <option value="detail">Sharp Text (Code / Slides)</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="field">
+              <div class="field-label-row">
+                <label for="costream-audio-app-select">Application Audio (Windows WASAPI)</label>
+                <button id="btn-costream-refresh-apps" class="btn btn-ghost btn-sm" type="button">
+                  Refresh Apps
+                </button>
+              </div>
+              <select id="costream-audio-app-select">
+                <option value="">No Audio (Video Only)</option>
+                <option value="exclude-discord">All PC Audio (Exclude Discord)</option>
+              </select>
+              <p id="costream-audio-app-hint" class="field-hint">
+                Pick a single app or "All PC Audio (Exclude Discord)". Tip: mute the watched stream when capturing all PC audio to avoid echo.
+              </p>
+            </div>
+
+            <div id="costream-error" class="alert alert-error hidden"></div>
+
+            <div class="actions-row">
+              <button id="btn-costream-cancel" class="btn btn-ghost" type="button">
+                Cancel
+              </button>
+              <button id="btn-costream-start" class="btn btn-primary" type="submit">
+                Pick Screen &amp; Share
+              </button>
+            </div>
+          </form>
         </div>
       </div>
     </div>

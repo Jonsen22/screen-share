@@ -9,7 +9,7 @@ import {
 } from "./audio/app-audio";
 import { checkForAppUpdate, getCurrentAppVersion } from "./version-check";
 import { ConnectedViewer, ContentHintMode, HostManager, QualityPresetId } from "./webrtc/host";
-import { normalizeSignalingUrl } from "./webrtc/signaling";
+import { ActiveStreamInfo, normalizeSignalingUrl } from "./webrtc/signaling";
 import { ViewerManager } from "./webrtc/viewer";
 
 const SIGNALING_STORAGE_KEY = import.meta.env.DEV
@@ -86,6 +86,15 @@ const btnBanConfirm = el<HTMLButtonElement>("btn-ban-confirm");
 const btnHostMonitor = el<HTMLButtonElement>("btn-host-monitor");
 const btnHostMute = el<HTMLButtonElement>("btn-host-mute");
 const hostPreview = el<HTMLVideoElement>("host-preview");
+const hostRemoteVideo = el<HTMLVideoElement>("host-remote-video");
+const hostRemoteBanner = el<HTMLElement>("host-remote-banner");
+const hostRemoteBannerText = el<HTMLElement>("host-remote-banner-text");
+const hostRemoteControls = el<HTMLElement>("host-remote-controls");
+const hostRemoteBadge = el<HTMLElement>("host-remote-badge");
+const btnHostRemoteMute = el<HTMLButtonElement>("btn-host-remote-mute");
+const hostRemoteVolume = el<HTMLInputElement>("host-remote-volume");
+const btnHostBackPreview = el<HTMLButtonElement>("btn-host-back-preview");
+const hostStreamsList = el<HTMLElement>("host-streams-list");
 const hostRoomCode = el<HTMLElement>("host-room-code");
 const hostVideoMeta = el<HTMLElement>("host-video-meta");
 const hostViewerPill = el<HTMLElement>("host-viewer-pill");
@@ -104,8 +113,14 @@ const viewerJoinForm = el<HTMLFormElement>("viewer-join-form");
 const roomCodeInput = el<HTMLInputElement>("room-code-input");
 const btnJoinRoom = el<HTMLButtonElement>("btn-join-room");
 const viewerError = el<HTMLElement>("viewer-error");
+const viewerStreamsList = el<HTMLElement>("viewer-streams-list");
+const viewerShareControls = el<HTMLElement>("viewer-share-controls");
+const btnViewerShare = el<HTMLButtonElement>("btn-viewer-share");
+const btnViewerSwitchScreen = el<HTMLButtonElement>("btn-viewer-switch-screen");
+const btnViewerShareMute = el<HTMLButtonElement>("btn-viewer-share-mute");
 const viewerVideoWrap = el<HTMLElement>("viewer-video-wrap");
 const viewerVideo = el<HTMLVideoElement>("viewer-video");
+const viewerLocalPreview = el<HTMLVideoElement>("viewer-local-preview");
 const viewerBanner = el<HTMLElement>("viewer-banner");
 const viewerBannerText = el<HTMLElement>("viewer-banner-text");
 const btnUnmuteOverlay = el<HTMLButtonElement>("btn-unmute-overlay");
@@ -116,6 +131,18 @@ const btnToggleStats = el<HTMLButtonElement>("btn-toggle-stats");
 const btnFullscreen = el<HTMLButtonElement>("btn-fullscreen");
 const btnLeaveRoom = el<HTMLButtonElement>("btn-leave-room");
 const statsHud = el<HTMLElement>("stats-hud");
+
+// Co-stream modal elements
+const costreamModal = el<HTMLElement>("costream-modal");
+const costreamForm = el<HTMLFormElement>("costream-form");
+const costreamPresetSelect = el<HTMLSelectElement>("costream-preset-select");
+const costreamHintSelect = el<HTMLSelectElement>("costream-hint-select");
+const costreamAudioAppSelect = el<HTMLSelectElement>("costream-audio-app-select");
+const btnCostreamRefreshApps = el<HTMLButtonElement>("btn-costream-refresh-apps");
+const costreamAudioAppHint = el<HTMLElement>("costream-audio-app-hint");
+const costreamError = el<HTMLElement>("costream-error");
+const btnCostreamCancel = el<HTMLButtonElement>("btn-costream-cancel");
+const btnCostreamStart = el<HTMLButtonElement>("btn-costream-start");
 
 const statRes = el<HTMLElement>("stat-res");
 const statFps = el<HTMLElement>("stat-fps");
@@ -399,16 +426,22 @@ async function refreshAudioApps(): Promise<void> {
     detectedDiscord = discord;
     populateAppSelect(audioAppSelect, apps, discord, audioAppSelect.value);
     populateAppSelect(liveAudioAppSelect, apps, discord, liveAudioAppSelect.value);
+    populateAppSelect(costreamAudioAppSelect, apps, discord, costreamAudioAppSelect.value);
     updateAudioHint(audioAppSelect, audioAppHint);
     updateAudioHint(liveAudioAppSelect, liveAudioAppHint);
+    updateAudioHint(costreamAudioAppSelect, costreamAudioAppHint);
   } catch (err) {
     showAlert(hostError, `Could not enumerate Windows apps: ${String(err)}`);
   }
 }
 
 audioAppSelect.addEventListener("change", () => updateAudioHint(audioAppSelect, audioAppHint));
+costreamAudioAppSelect.addEventListener("change", () =>
+  updateAudioHint(costreamAudioAppSelect, costreamAudioAppHint)
+);
 btnRefreshApps.addEventListener("click", () => void refreshAudioApps());
 btnLiveRefreshApps.addEventListener("click", () => void refreshAudioApps());
+btnCostreamRefreshApps.addEventListener("click", () => void refreshAudioApps());
 
 // Audio meter & status animation loop while hosting
 function startMeterLoop(): void {
@@ -534,6 +567,75 @@ function renderViewersList(viewers: ConnectedViewer[], maxViewers: number): void
   }
 }
 
+function renderHostStreamsBar(
+  streams: ActiveStreamInfo[],
+  watchedStreamerId: string | null
+): void {
+  hostStreamsList.innerHTML = "";
+
+  const selfBtn = document.createElement("button");
+  selfBtn.type = "button";
+  selfBtn.role = "tab";
+  const viewingSelf = !watchedStreamerId;
+  selfBtn.className = `stream-pill is-self${viewingSelf ? " active" : ""}`;
+  selfBtn.setAttribute("aria-selected", String(viewingSelf));
+  const selfDot = document.createElement("span");
+  selfDot.className = "stream-pill-dot";
+  selfBtn.appendChild(selfDot);
+  selfBtn.appendChild(document.createTextNode("Your Stream (Preview)"));
+  selfBtn.addEventListener("click", () => {
+    hostManager.stopWatching(true);
+  });
+  hostStreamsList.appendChild(selfBtn);
+
+  for (const stream of streams) {
+    if (stream.streamerId === "host") continue;
+    const isActive = watchedStreamerId === stream.streamerId;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.role = "tab";
+    btn.className = `stream-pill${isActive ? " active" : ""}`;
+    btn.setAttribute("aria-selected", String(isActive));
+    const dot = document.createElement("span");
+    dot.className = "stream-pill-dot";
+    btn.appendChild(dot);
+    btn.appendChild(document.createTextNode(stream.nickname));
+    btn.addEventListener("click", () => {
+      hostManager.watchStream(stream.streamerId);
+    });
+    hostStreamsList.appendChild(btn);
+  }
+
+  if (viewingSelf) {
+    hostRemoteVideo.classList.add("hidden");
+    hostRemoteControls.classList.add("hidden");
+    hostRemoteBanner.classList.add("hidden");
+    hostPreview.classList.remove("hidden");
+  } else {
+    const watched = streams.find((s) => s.streamerId === watchedStreamerId);
+    hostRemoteBadge.textContent = watched ? `Watching ${watched.nickname}` : "Watching co-streamer";
+    hostPreview.classList.add("hidden");
+    hostRemoteVideo.classList.remove("hidden");
+    hostRemoteControls.classList.remove("hidden");
+  }
+}
+
+btnHostBackPreview.addEventListener("click", () => {
+  hostManager.stopWatching(true);
+});
+
+hostRemoteVolume.addEventListener("input", () => {
+  const vol = Number(hostRemoteVolume.value);
+  hostRemoteVideo.volume = vol;
+  hostRemoteVideo.muted = vol === 0;
+  btnHostRemoteMute.textContent = hostRemoteVideo.muted ? "Unmute" : "Mute";
+});
+
+btnHostRemoteMute.addEventListener("click", () => {
+  hostRemoteVideo.muted = !hostRemoteVideo.muted;
+  btnHostRemoteMute.textContent = hostRemoteVideo.muted ? "Unmute" : "Mute";
+});
+
 // Host Manager
 const hostManager = new HostManager({
   onRoomCreated(code, maxViewers, previewStream) {
@@ -554,6 +656,11 @@ const hostManager = new HostManager({
     btnHostMute.classList.remove("btn-active");
     btnHostMonitor.textContent = "Test Sound";
     btnHostMonitor.classList.remove("btn-active");
+    hostRemoteVideo.srcObject = null;
+    hostRemoteVideo.classList.add("hidden");
+    hostRemoteControls.classList.add("hidden");
+    hostRemoteBanner.classList.add("hidden");
+    hostPreview.classList.remove("hidden");
 
     attachHostPreview(previewStream);
 
@@ -570,6 +677,37 @@ const hostManager = new HostManager({
     renderViewersList(viewers, maxViewers);
   },
 
+  onActiveStreamsChange(streams, watchedStreamerId) {
+    renderHostStreamsBar(streams, watchedStreamerId);
+  },
+
+  onRemoteStream(stream) {
+    if (!stream) {
+      hostRemoteVideo.srcObject = null;
+      return;
+    }
+    if (hostRemoteVideo.srcObject !== stream) {
+      hostRemoteVideo.srcObject = stream;
+    }
+    hostRemoteVideo.volume = Number(hostRemoteVolume.value);
+    hostRemoteVideo.muted = Number(hostRemoteVolume.value) === 0;
+    btnHostRemoteMute.textContent = hostRemoteVideo.muted ? "Unmute" : "Mute";
+    void hostRemoteVideo.play().catch(() => {
+      hostRemoteVideo.muted = true;
+      btnHostRemoteMute.textContent = "Unmute";
+      void hostRemoteVideo.play().catch(() => {});
+    });
+  },
+
+  onRemoteBanner(text) {
+    if (!text) {
+      hostRemoteBanner.classList.add("hidden");
+    } else {
+      hostRemoteBannerText.textContent = text;
+      hostRemoteBanner.classList.remove("hidden");
+    }
+  },
+
   onSignalingStatus(status) {
     if (status === "reconnecting") {
       hostStatusText.textContent = "Reconnecting signaling (stream still live)...";
@@ -584,6 +722,11 @@ const hostManager = new HostManager({
     setTabsLocked(false);
 
     hostPreview.srcObject = null;
+    hostRemoteVideo.srcObject = null;
+    hostRemoteVideo.classList.add("hidden");
+    hostRemoteControls.classList.add("hidden");
+    hostRemoteBanner.classList.add("hidden");
+    hostPreview.classList.remove("hidden");
     hostLive.classList.add("hidden");
     hostSetup.classList.remove("hidden");
     btnStartShare.disabled = false;
@@ -810,19 +953,161 @@ btnHostMute.addEventListener("click", () => {
   btnHostMute.classList.toggle("btn-active", nextMuted);
 });
 
+let viewerJoinedCode = "";
+
+function openCostreamModal(): void {
+  if (!isWatching) return;
+  showAlert(costreamError, null);
+  btnCostreamStart.disabled = false;
+  btnCostreamStart.textContent = "Pick Screen & Share";
+  if (isTauriRuntime()) {
+    void refreshAudioApps();
+  }
+  costreamModal.classList.remove("hidden");
+  window.requestAnimationFrame(() => btnCostreamStart.focus());
+}
+
+function closeCostreamModal(): void {
+  costreamModal.classList.add("hidden");
+  showAlert(costreamError, null);
+}
+
+btnCostreamCancel.addEventListener("click", () => closeCostreamModal());
+costreamModal.addEventListener("click", (e) => {
+  if (e.target === costreamModal) {
+    closeCostreamModal();
+  }
+});
+
+costreamForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  showAlert(costreamError, null);
+  btnCostreamStart.disabled = true;
+  btnCostreamStart.textContent = "Starting...";
+
+  const audioTarget = parseAudioTarget(costreamAudioAppSelect.value);
+  try {
+    await viewerManager.startSharing({
+      preset: costreamPresetSelect.value as QualityPresetId,
+      contentHint: costreamHintSelect.value as ContentHintMode,
+      audioTarget,
+    });
+    closeCostreamModal();
+  } catch (err) {
+    btnCostreamStart.disabled = false;
+    btnCostreamStart.textContent = "Pick Screen & Share";
+    showAlert(costreamError, err instanceof Error ? err.message : String(err));
+  }
+});
+
+btnViewerShare.addEventListener("click", () => {
+  if (!isWatching) return;
+  if (viewerManager.isSharing()) {
+    void viewerManager.stopSharing();
+  } else {
+    openCostreamModal();
+  }
+});
+
+btnViewerSwitchScreen.addEventListener("click", async () => {
+  if (!viewerManager.isSharing()) return;
+  btnViewerSwitchScreen.disabled = true;
+  btnViewerSwitchScreen.textContent = "Picking...";
+  try {
+    await viewerManager.switchSharedScreen();
+  } catch (err) {
+    viewerBannerText.textContent = err instanceof Error ? err.message : String(err);
+    viewerBanner.classList.remove("hidden");
+  } finally {
+    btnViewerSwitchScreen.disabled = false;
+    btnViewerSwitchScreen.textContent = "Change Screen";
+  }
+});
+
+btnViewerShareMute.addEventListener("click", () => {
+  const nextMuted = !viewerManager.isSharedAudioMuted();
+  viewerManager.setSharedAudioMuted(nextMuted);
+  btnViewerShareMute.textContent = nextMuted ? "Unmute Shared Audio" : "Mute Shared Audio";
+  btnViewerShareMute.classList.toggle("btn-active", nextMuted);
+});
+
+function renderViewerStreamsBar(
+  streams: ActiveStreamInfo[],
+  watchedStreamerId: string | null,
+  selfId: string
+): void {
+  viewerStreamsList.innerHTML = "";
+  if (streams.length === 0) {
+    const empty = document.createElement("span");
+    empty.className = "muted small";
+    empty.textContent = "No active streams";
+    viewerStreamsList.appendChild(empty);
+  } else {
+    for (const stream of streams) {
+      const isSelf = stream.streamerId === selfId;
+      const isActive = watchedStreamerId === stream.streamerId;
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.role = "tab";
+      btn.className = `stream-pill${isSelf ? " is-self" : ""}${isActive ? " active" : ""}`;
+      btn.setAttribute("aria-selected", String(isActive));
+      const dot = document.createElement("span");
+      dot.className = "stream-pill-dot";
+      btn.appendChild(dot);
+      btn.appendChild(
+        document.createTextNode(isSelf ? "Your Stream (Preview)" : stream.nickname)
+      );
+      btn.addEventListener("click", () => {
+        viewerManager.watchStream(stream.streamerId);
+      });
+      viewerStreamsList.appendChild(btn);
+    }
+  }
+
+  const viewingSelf = Boolean(selfId && watchedStreamerId === selfId);
+  if (viewingSelf) {
+    viewerVideo.classList.add("hidden");
+    viewerLocalPreview.classList.remove("hidden");
+    btnUnmuteOverlay.classList.add("hidden");
+    viewerRoomBadge.textContent = `Room ${viewerJoinedCode} · Your Preview (Muted)`;
+  } else {
+    viewerLocalPreview.classList.add("hidden");
+    viewerVideo.classList.remove("hidden");
+    const activeStream = streams.find((s) => s.streamerId === watchedStreamerId);
+    viewerRoomBadge.textContent = activeStream
+      ? `Room ${viewerJoinedCode} · ${activeStream.nickname}`
+      : `Room ${viewerJoinedCode}`;
+  }
+}
+
 // Viewer Manager
 const viewerManager = new ViewerManager({
   onJoined(code, hostNickname) {
     isWatching = true;
+    viewerJoinedCode = code;
     setTabsLocked(true);
     showAlert(viewerError, null);
     btnUnmuteOverlay.classList.add("hidden");
+    viewerLocalPreview.srcObject = null;
+    viewerLocalPreview.classList.add("hidden");
+    viewerVideo.classList.remove("hidden");
+    viewerShareControls.classList.add("hidden");
+    btnViewerShare.textContent = "Share My Screen";
+    btnViewerShare.classList.remove("btn-danger");
+    btnViewerShare.classList.add("btn-primary");
+    btnViewerShareMute.textContent = "Mute Shared Audio";
+    btnViewerShareMute.classList.remove("btn-active");
     viewerRoomBadge.textContent = `Room ${code} · ${hostNickname}`;
     viewerJoin.classList.add("hidden");
     viewerStage.classList.remove("hidden");
   },
 
   onStream(stream) {
+    if (!stream) {
+      viewerVideo.srcObject = null;
+      btnUnmuteOverlay.classList.add("hidden");
+      return;
+    }
     if (viewerVideo.srcObject !== stream) {
       viewerVideo.srcObject = stream;
     }
@@ -835,6 +1120,26 @@ const viewerManager = new ViewerManager({
       btnUnmuteOverlay.classList.remove("hidden");
       void viewerVideo.play().catch(() => {});
     });
+  },
+
+  onLocalPreviewChange(stream, sharing) {
+    viewerLocalPreview.srcObject = stream;
+    viewerShareControls.classList.toggle("hidden", !sharing);
+    if (sharing) {
+      btnViewerShare.textContent = "Stop Sharing";
+      btnViewerShare.classList.remove("btn-primary");
+      btnViewerShare.classList.add("btn-danger");
+    } else {
+      btnViewerShare.textContent = "Share My Screen";
+      btnViewerShare.classList.remove("btn-danger");
+      btnViewerShare.classList.add("btn-primary");
+      btnViewerShareMute.textContent = "Mute Shared Audio";
+      btnViewerShareMute.classList.remove("btn-active");
+    }
+  },
+
+  onActiveStreamsChange(streams, watchedStreamerId, selfId) {
+    renderViewerStreamsBar(streams, watchedStreamerId, selfId);
   },
 
   onBanner(text) {
@@ -857,14 +1162,30 @@ const viewerManager = new ViewerManager({
     statState.textContent = stats.state;
   },
 
+  onShareError(message) {
+    viewerBannerText.textContent = message;
+    viewerBanner.classList.remove("hidden");
+  },
+
   onEnded(reason) {
     isWatching = false;
+    viewerJoinedCode = "";
+    closeCostreamModal();
     setTabsLocked(false);
 
     if (document.fullscreenElement) {
       void document.exitFullscreen().catch(() => {});
     }
     viewerVideo.srcObject = null;
+    viewerLocalPreview.srcObject = null;
+    viewerLocalPreview.classList.add("hidden");
+    viewerVideo.classList.remove("hidden");
+    viewerShareControls.classList.add("hidden");
+    btnViewerShare.textContent = "Share My Screen";
+    btnViewerShare.classList.remove("btn-danger");
+    btnViewerShare.classList.add("btn-primary");
+    btnViewerShareMute.textContent = "Mute Shared Audio";
+    btnViewerShareMute.classList.remove("btn-active");
     btnUnmuteOverlay.classList.add("hidden");
     viewerStage.classList.add("hidden");
     viewerJoin.classList.remove("hidden");
@@ -960,6 +1281,12 @@ btnFullscreen.addEventListener("click", () => void toggleFullscreen());
 viewerVideo.addEventListener("dblclick", () => void toggleFullscreen());
 
 window.addEventListener("keydown", (e) => {
+  if (!costreamModal.classList.contains("hidden")) {
+    if (e.key === "Escape") {
+      closeCostreamModal();
+    }
+    return;
+  }
   if (!banModal.classList.contains("hidden")) {
     if (e.key === "Escape") {
       closeBanModal();

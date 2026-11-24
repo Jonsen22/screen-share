@@ -76,6 +76,8 @@ const limiter = new RateLimiter({
  *   viewers: Map<string, { ws: WebSocket, nickname: string, ip: string, viewerToken: string }>,
  *   viewerGraceTimers: Map<string, NodeJS.Timeout>,
  *   bannedIps: Set<string>,
+ *   activeStreams: Map<string, { streamerId: string, nickname: string }>,
+ *   watchersByStreamer: Map<string, Set<string>>,
  *   createdAt: number
  * }} Room
  */
@@ -169,6 +171,57 @@ function sendJson(ws, message) {
   }
 }
 
+function getParticipantId(ws) {
+  const meta = ws?._meta;
+  if (!meta) return null;
+  if (meta.role === "host") return "host";
+  if (meta.role === "viewer" && meta.viewerId) return meta.viewerId;
+  return null;
+}
+
+function getParticipantWs(room, participantId) {
+  if (!room || !participantId) return null;
+  if (participantId === "host") return room.host;
+  return room.viewers.get(participantId)?.ws || null;
+}
+
+function listActiveStreams(room) {
+  return Array.from(room.activeStreams.values());
+}
+
+function broadcastRoom(room, payload, excludeId = null) {
+  if (room.host && excludeId !== "host") {
+    sendJson(room.host, payload);
+  }
+  for (const [viewerId, viewer] of room.viewers.entries()) {
+    if (viewerId !== excludeId) {
+      sendJson(viewer.ws, payload);
+    }
+  }
+}
+
+function stopStreamerInRoom(room, code, streamerId) {
+  if (!room.activeStreams.has(streamerId)) return;
+  room.activeStreams.delete(streamerId);
+  room.watchersByStreamer.delete(streamerId);
+  broadcastRoom(room, { type: "stream_stopped", streamerId });
+  console.log(`[room ${code}] stream stopped by ${streamerId}`);
+}
+
+function cleanupParticipantStreams(room, code, participantId) {
+  stopStreamerInRoom(room, code, participantId);
+  for (const [streamerId, watchers] of room.watchersByStreamer.entries()) {
+    if (watchers.delete(participantId)) {
+      const streamerWs = getParticipantWs(room, streamerId);
+      sendJson(streamerWs, {
+        type: "viewer_unwatching",
+        viewerId: participantId,
+        streamerId,
+      });
+    }
+  }
+}
+
 function destroyRoom(code, notifyViewers, reason) {
   const room = rooms.get(code);
   if (!room) return;
@@ -181,6 +234,8 @@ function destroyRoom(code, notifyViewers, reason) {
     clearTimeout(timer);
   }
   room.viewerGraceTimers.clear();
+  room.activeStreams.clear();
+  room.watchersByStreamer.clear();
 
   if (room.host) {
     room.host._meta = null;
@@ -241,6 +296,7 @@ function cleanupClient(ws, explicit = false) {
         room.viewerGraceTimers.delete(meta.viewerId);
       }
       room.viewers.delete(meta.viewerId);
+      cleanupParticipantStreams(room, meta.code, meta.viewerId);
       sendJson(room.host, {
         type: "viewer_left",
         viewerId: meta.viewerId,
@@ -263,6 +319,7 @@ function cleanupClient(ws, explicit = false) {
       const current = r.viewers.get(meta.viewerId);
       if (current && current.ws === ws) {
         r.viewers.delete(meta.viewerId);
+        cleanupParticipantStreams(r, meta.code, meta.viewerId);
         sendJson(r.host, {
           type: "viewer_left",
           viewerId: meta.viewerId,
@@ -445,6 +502,8 @@ const server = http.createServer((req, res) => {
         },
         viewerCount: room.viewers.size,
         viewers: viewerSummaries,
+        activeStreams: room.activeStreams.size,
+        streamers: listActiveStreams(room),
         bannedIpCount: room.bannedIps.size,
       });
     }
@@ -629,7 +688,9 @@ wss.on("connection", (ws) => {
         const code = generateRoomCode();
         const hostToken = crypto.randomBytes(16).toString("hex");
         const hostNickname = sanitizeNickname(msg.nickname, "Host");
-        rooms.set(code, {
+        const activeStreams = new Map();
+        activeStreams.set("host", { streamerId: "host", nickname: hostNickname });
+        const room = {
           host: ws,
           hostIp: ip,
           hostToken,
@@ -638,14 +699,18 @@ wss.on("connection", (ws) => {
           viewers: new Map(),
           viewerGraceTimers: new Map(),
           bannedIps: new Set(),
+          activeStreams,
+          watchersByStreamer: new Map(),
           createdAt: Date.now(),
-        });
+        };
+        rooms.set(code, room);
         ws._meta = { role: "host", code, nickname: hostNickname };
         sendJson(ws, {
           type: "room_created",
           code,
           hostToken,
           maxViewers: MAX_VIEWERS,
+          activeStreams: listActiveStreams(room),
         });
         console.log(`[room ${code}] created by ${hostNickname}`);
         break;
@@ -707,6 +772,7 @@ wss.on("connection", (ws) => {
             code,
             maxViewers: MAX_VIEWERS,
             viewerCount: existing.viewers.size,
+            activeStreams: listActiveStreams(existing),
           });
           console.log(`[room ${code}] reclaimed by ${existing.hostNickname}`);
         } else {
@@ -720,7 +786,11 @@ wss.on("connection", (ws) => {
             });
             return;
           }
-          rooms.set(code, {
+          const activeStreams = new Map();
+          if (msg.isStreaming !== false) {
+            activeStreams.set("host", { streamerId: "host", nickname: hostNickname });
+          }
+          const recreated = {
             host: ws,
             hostIp: ip,
             hostToken,
@@ -729,14 +799,18 @@ wss.on("connection", (ws) => {
             viewers: new Map(),
             viewerGraceTimers: new Map(),
             bannedIps: new Set(),
+            activeStreams,
+            watchersByStreamer: new Map(),
             createdAt: Date.now(),
-          });
+          };
+          rooms.set(code, recreated);
           ws._meta = { role: "host", code, nickname: hostNickname };
           sendJson(ws, {
             type: "room_reclaimed",
             code,
             maxViewers: MAX_VIEWERS,
             viewerCount: 0,
+            activeStreams: listActiveStreams(recreated),
           });
           console.log(`[room ${code}] recreated by ${hostNickname} after restart`);
         }
@@ -767,6 +841,7 @@ wss.on("connection", (ws) => {
 
         room.viewers.delete(targetId);
         target.ws._meta = null;
+        cleanupParticipantStreams(room, meta.code, targetId);
         sendJson(target.ws, {
           type: "kicked",
           reason: "You were removed from the room by the host.",
@@ -809,6 +884,7 @@ wss.on("connection", (ws) => {
         }
         room.viewers.delete(targetId);
         target.ws._meta = null;
+        cleanupParticipantStreams(room, meta.code, targetId);
         sendJson(target.ws, {
           type: "banned",
           reason: "You were banned from this room by the host.",
@@ -887,6 +963,7 @@ wss.on("connection", (ws) => {
           hostNickname: room.hostNickname,
           viewerCount: room.viewers.size,
           maxViewers: MAX_VIEWERS,
+          activeStreams: listActiveStreams(room),
         });
         sendJson(room.host, {
           type: "viewer_joined",
@@ -954,7 +1031,101 @@ wss.on("connection", (ws) => {
           viewerToken: existing.viewerToken,
         });
         ws._meta = { role: "viewer", code, viewerId, nickname: existing.nickname };
-        sendJson(ws, { type: "reattached", code, viewerId });
+        sendJson(ws, {
+          type: "reattached",
+          code,
+          viewerId,
+          activeStreams: listActiveStreams(room),
+        });
+        break;
+      }
+
+      case "start_stream": {
+        const meta = ws._meta;
+        if (!meta) return;
+        const room = rooms.get(meta.code);
+        if (!room) return;
+        const streamerId = getParticipantId(ws);
+        if (!streamerId) return;
+
+        const alreadyActive = room.activeStreams.has(streamerId);
+        room.activeStreams.set(streamerId, { streamerId, nickname: meta.nickname });
+        if (!alreadyActive) {
+          broadcastRoom(room, {
+            type: "stream_started",
+            streamerId,
+            nickname: meta.nickname,
+          });
+          console.log(`[room ${meta.code}] stream started by ${streamerId} (${meta.nickname})`);
+        }
+        break;
+      }
+
+      case "stop_stream": {
+        const meta = ws._meta;
+        if (!meta) return;
+        const room = rooms.get(meta.code);
+        if (!room) return;
+        const streamerId = getParticipantId(ws);
+        if (!streamerId) return;
+
+        stopStreamerInRoom(room, meta.code, streamerId);
+        break;
+      }
+
+      case "watch_stream": {
+        const meta = ws._meta;
+        if (!meta) return;
+        const room = rooms.get(meta.code);
+        if (!room) return;
+        const watcherId = getParticipantId(ws);
+        if (!watcherId) return;
+
+        const streamerId = typeof msg.streamerId === "string" ? msg.streamerId : "";
+        if (!streamerId || watcherId === streamerId) return;
+
+        if (!room.activeStreams.has(streamerId)) {
+          sendJson(ws, { type: "stream_stopped", streamerId });
+          return;
+        }
+
+        let watchers = room.watchersByStreamer.get(streamerId);
+        if (!watchers) {
+          watchers = new Set();
+          room.watchersByStreamer.set(streamerId, watchers);
+        }
+        watchers.add(watcherId);
+
+        const streamerWs = getParticipantWs(room, streamerId);
+        sendJson(streamerWs, {
+          type: "viewer_watching",
+          viewerId: watcherId,
+          nickname: meta.nickname,
+          streamerId,
+        });
+        break;
+      }
+
+      case "stop_watching": {
+        const meta = ws._meta;
+        if (!meta) return;
+        const room = rooms.get(meta.code);
+        if (!room) return;
+        const watcherId = getParticipantId(ws);
+        if (!watcherId) return;
+
+        const streamerId = typeof msg.streamerId === "string" ? msg.streamerId : "";
+        if (!streamerId) return;
+
+        const watchers = room.watchersByStreamer.get(streamerId);
+        if (watchers && watchers.delete(watcherId)) {
+          const streamerWs = getParticipantWs(room, streamerId);
+          sendJson(streamerWs, {
+            type: "viewer_unwatching",
+            viewerId: watcherId,
+            streamerId,
+          });
+        }
         break;
       }
 
@@ -971,19 +1142,20 @@ wss.on("connection", (ws) => {
         const room = rooms.get(meta.code);
         if (!room) return;
 
-        if (meta.role === "host") {
-          const target = room.viewers.get(msg.targetId);
-          if (target) {
-            sendJson(target.ws, {
-              type: "signal",
-              fromId: "host",
-              payload: msg.payload,
-            });
-          }
-        } else if (meta.role === "viewer") {
-          sendJson(room.host, {
+        const fromId = getParticipantId(ws);
+        if (!fromId) return;
+        const targetId =
+          typeof msg.targetId === "string" && msg.targetId ? msg.targetId : "host";
+        const streamId =
+          typeof msg.streamId === "string" && msg.streamId ? msg.streamId : "host";
+        if (targetId === fromId) return;
+
+        const targetWs = getParticipantWs(room, targetId);
+        if (targetWs) {
+          sendJson(targetWs, {
             type: "signal",
-            fromId: meta.viewerId,
+            fromId,
+            streamId,
             payload: msg.payload,
           });
         }

@@ -1,36 +1,31 @@
-import { SignalingClient, ServerMessage } from "./signaling";
+import { AudioBridgeStatus } from "../audio/app-audio";
+import { PublisherStartOptions, StreamPublisher } from "./publisher";
+import { ActiveStreamInfo, ServerMessage, SignalingClient } from "./signaling";
+import { StreamSubscriber, ViewerStats } from "./subscriber";
 
-const ICE_SERVERS: RTCIceServer[] = [
-  { urls: "stun:stun.l.google.com:19302" },
-  { urls: "stun:stun1.l.google.com:19302" },
-];
-
-export interface ViewerStats {
-  resolution: string;
-  fps: string;
-  bitrate: string;
-  audio: string;
-  rtt: string;
-  packetLoss: string;
-  codec: string;
-  state: string;
-}
+export type { ViewerStats } from "./subscriber";
 
 export interface ViewerCallbacks {
-  onJoined: (code: string, hostNickname: string) => void;
-  onStream: (stream: MediaStream) => void;
+  onJoined: (code: string, hostNickname: string, viewerId: string) => void;
+  onStream: (stream: MediaStream | null) => void;
+  onLocalPreviewChange?: (stream: MediaStream | null, sharing: boolean) => void;
+  onActiveStreamsChange?: (
+    streams: ActiveStreamInfo[],
+    watchedStreamerId: string | null,
+    selfId: string,
+    isSharing: boolean
+  ) => void;
   onBanner: (text: string | null) => void;
   onStats: (stats: ViewerStats) => void;
   onEnded: (reason?: string) => void;
+  onShareError?: (message: string) => void;
 }
 
 export class ViewerManager {
   private signaling = new SignalingClient();
-  private pc: RTCPeerConnection | null = null;
-  private remoteStream = new MediaStream();
-  private pendingIce: RTCIceCandidateInit[] = [];
-  private remoteSet = false;
-  private statsTimer: number | null = null;
+  private subscriber: StreamSubscriber;
+  private publisher: StreamPublisher;
+  private activeStreams = new Map<string, ActiveStreamInfo>();
   private reconnectTimer: number | null = null;
   private reconnecting = false;
   private signalingUrl = "";
@@ -38,15 +33,46 @@ export class ViewerManager {
   private viewerId = "";
   private viewerToken = "";
   private viewerNickname = "Viewer";
-  private prevBytes = 0;
-  private prevTimestamp = 0;
-  private prevAudioBytes = 0;
-  private prevAudioTimestamp = 0;
   private active = false;
+  private sharing = false;
+  private viewingSelfPreview = false;
   private callbacks: ViewerCallbacks;
 
   constructor(callbacks: ViewerCallbacks) {
     this.callbacks = callbacks;
+
+    this.subscriber = new StreamSubscriber(this.signaling, {
+      onStream: (stream) => this.callbacks.onStream(stream),
+      onBanner: (text) => this.callbacks.onBanner(text),
+      onStats: (stats) => this.callbacks.onStats(stats),
+    });
+
+    this.publisher = new StreamPublisher(this.signaling, {
+      onStreamChanged: (stream) => {
+        if (this.sharing) {
+          this.callbacks.onLocalPreviewChange?.(stream, true);
+        }
+      },
+      onUnexpectedTrackEnded: () => {
+        if (this.sharing) {
+          void this.stopSharing();
+        }
+      },
+      onError: (msg) => this.callbacks.onShareError?.(msg),
+    });
+  }
+
+  getSelfId(): string {
+    return this.viewerId;
+  }
+
+  isSharing(): boolean {
+    return this.sharing;
+  }
+
+  getWatchedStreamerId(): string | null {
+    if (this.viewingSelfPreview) return this.viewerId;
+    return this.subscriber.getWatchedStreamerId();
   }
 
   async join(signalingUrl: string, roomCode: string, nickname: string): Promise<void> {
@@ -62,6 +88,7 @@ export class ViewerManager {
         viewerId: string;
         viewerToken: string;
         hostNickname: string;
+        activeStreams: ActiveStreamInfo[];
       }>((resolve, reject) => {
         const timer = window.setTimeout(() => {
           unsub();
@@ -77,6 +104,9 @@ export class ViewerManager {
               viewerId: msg.viewerId,
               viewerToken: msg.viewerToken || "",
               hostNickname: msg.hostNickname || "Host",
+              activeStreams: msg.activeStreams || [
+                { streamerId: "host", nickname: msg.hostNickname || "Host" },
+              ],
             });
           } else if (msg.type === "error") {
             window.clearTimeout(timer);
@@ -92,31 +122,163 @@ export class ViewerManager {
       this.roomCode = joined.code;
       this.viewerId = joined.viewerId;
       this.viewerToken = joined.viewerToken;
-      this.remoteStream = new MediaStream();
-      this.pendingIce = [];
-      this.remoteSet = false;
-      this.prevBytes = 0;
-      this.prevTimestamp = 0;
-      this.prevAudioBytes = 0;
-      this.prevAudioTimestamp = 0;
+      this.sharing = false;
+      this.viewingSelfPreview = false;
+      this.publisher.setSelfId(joined.viewerId);
 
-      this.setupPeerConnection();
+      this.syncActiveStreams(joined.activeStreams);
+
       this.signaling.onMessage((msg) => this.handleServerMessage(msg));
       this.signaling.onClose(() => {
         if (this.active) {
-          // Never interrupt a live P2P WebRTC stream when signaling blips;
-          // quietly reattach signaling in the background.
           this.scheduleSignalingReattach();
         }
       });
 
-      this.callbacks.onJoined(joined.code, joined.hostNickname);
-      this.callbacks.onBanner("Connecting to host...");
-      this.startStatsLoop();
+      this.callbacks.onJoined(joined.code, joined.hostNickname, joined.viewerId);
+
+      const firstStream = Array.from(this.activeStreams.values()).find(
+        (s) => s.streamerId !== this.viewerId
+      );
+      if (firstStream) {
+        this.watchStream(firstStream.streamerId);
+      } else {
+        this.callbacks.onBanner("Waiting for someone to share their screen...");
+        this.emitActiveStreamsChange();
+      }
     } catch (err) {
-      this.cleanup();
+      await this.cleanup();
       throw err;
     }
+  }
+
+  private syncActiveStreams(list: ActiveStreamInfo[] | undefined): void {
+    this.activeStreams.clear();
+    if (list) {
+      for (const s of list) {
+        this.activeStreams.set(s.streamerId, s);
+      }
+    }
+    if (this.sharing && this.viewerId) {
+      this.activeStreams.set(this.viewerId, {
+        streamerId: this.viewerId,
+        nickname: this.viewerNickname,
+      });
+    }
+  }
+
+  private emitActiveStreamsChange(): void {
+    this.callbacks.onActiveStreamsChange?.(
+      Array.from(this.activeStreams.values()),
+      this.getWatchedStreamerId(),
+      this.viewerId,
+      this.sharing
+    );
+  }
+
+  watchStream(streamerId: string): void {
+    if (!this.active) return;
+    if (streamerId === this.viewerId) {
+      if (!this.sharing) return;
+      this.subscriber.stopWatching(true);
+      this.viewingSelfPreview = true;
+      this.callbacks.onBanner(null);
+      this.emitActiveStreamsChange();
+      return;
+    }
+
+    const info = this.activeStreams.get(streamerId);
+    if (!info) return;
+    this.viewingSelfPreview = false;
+    this.subscriber.watch(streamerId, info.nickname);
+    this.emitActiveStreamsChange();
+  }
+
+  stopWatching(notifyServer = true): void {
+    this.viewingSelfPreview = false;
+    this.subscriber.stopWatching(notifyServer);
+    this.emitActiveStreamsChange();
+  }
+
+  async startSharing(options: PublisherStartOptions): Promise<MediaStream> {
+    if (!this.active) {
+      throw new Error("Join a room before sharing your screen.");
+    }
+    if (this.sharing && this.publisher.getPreviewStream()) {
+      return this.publisher.getPreviewStream()!;
+    }
+
+    this.publisher.setSelfId(this.viewerId);
+    const previewStream = await this.publisher.start(options);
+    if (!this.active) {
+      await this.publisher.stop();
+      throw new Error("Left room before screen sharing started.");
+    }
+    this.sharing = true;
+
+    try {
+      this.signaling.send({ type: "start_stream" });
+    } catch {
+      // Will re-announce on reattach if socket briefly disconnected
+    }
+
+    this.activeStreams.set(this.viewerId, {
+      streamerId: this.viewerId,
+      nickname: this.viewerNickname,
+    });
+    this.callbacks.onLocalPreviewChange?.(previewStream, true);
+    this.emitActiveStreamsChange();
+    return previewStream;
+  }
+
+  async stopSharing(): Promise<void> {
+    if (!this.sharing) return;
+    this.sharing = false;
+
+    try {
+      this.signaling.send({ type: "stop_stream" });
+    } catch {
+      // Ignore if socket already closed
+    }
+
+    await this.publisher.stop();
+    this.activeStreams.delete(this.viewerId);
+    this.callbacks.onLocalPreviewChange?.(null, false);
+
+    if (this.viewingSelfPreview) {
+      this.viewingSelfPreview = false;
+      const other = Array.from(this.activeStreams.values()).find(
+        (s) => s.streamerId !== this.viewerId
+      );
+      if (other) {
+        this.subscriber.watch(other.streamerId, other.nickname);
+      } else {
+        this.callbacks.onBanner("Waiting for someone to share their screen...");
+      }
+    }
+
+    this.emitActiveStreamsChange();
+  }
+
+  async switchSharedScreen(): Promise<boolean> {
+    if (!this.active || !this.sharing) return false;
+    return this.publisher.switchScreen();
+  }
+
+  setSharedAudioMuted(muted: boolean): void {
+    this.publisher.setAudioMuted(muted);
+  }
+
+  isSharedAudioMuted(): boolean {
+    return this.publisher.isAudioMuted();
+  }
+
+  getSharedAudioStatus(): AudioBridgeStatus {
+    return this.publisher.getAudioStatus();
+  }
+
+  getSharedAudioLevel(): number {
+    return this.publisher.getAudioLevel();
   }
 
   private scheduleSignalingReattach(delayMs = 3000): void {
@@ -164,225 +326,132 @@ export class ViewerManager {
     if (!this.active) return;
     this.active = false;
     if (notifyServer) {
+      if (this.sharing) {
+        try {
+          this.signaling.send({ type: "stop_stream" });
+        } catch {
+          // Ignore
+        }
+      }
       try {
         this.signaling.send({ type: "leave_room" });
       } catch {
         // Ignore
       }
     }
-    this.cleanup();
+    void this.cleanup();
     this.callbacks.onEnded(reason);
-  }
-
-  private setupPeerConnection(): void {
-    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-    this.pc = pc;
-
-    pc.ontrack = (event) => {
-      if (event.streams[0]) {
-        this.callbacks.onStream(event.streams[0]);
-      } else {
-        this.remoteStream.addTrack(event.track);
-        this.callbacks.onStream(this.remoteStream);
-      }
-    };
-
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        try {
-          this.signaling.send({
-            type: "signal",
-            payload: { kind: "ice", candidate: event.candidate.toJSON() },
-          });
-        } catch {
-          // Ignore
-        }
-      }
-    };
-
-    pc.onconnectionstatechange = () => {
-      const state = pc.connectionState;
-      if (state === "connected") {
-        this.callbacks.onBanner(null);
-      } else if (state === "connecting") {
-        this.callbacks.onBanner("Connecting to host...");
-      } else if (state === "disconnected") {
-        this.callbacks.onBanner("Connection interrupted — reconnecting...");
-      } else if (state === "failed") {
-        this.leave("Peer connection failed (check firewall/NAT or network).");
-      }
-    };
   }
 
   private handleServerMessage(msg: ServerMessage): void {
     switch (msg.type) {
-      case "signal":
-        void this.handleSignal(msg.payload);
+      case "reattached": {
+        this.syncActiveStreams(msg.activeStreams);
+        if (this.sharing) {
+          try {
+            this.signaling.send({ type: "start_stream" });
+          } catch {
+            // Ignore
+          }
+        }
+        const watched = this.subscriber.getWatchedStreamerId();
+        if (watched && !this.activeStreams.has(watched)) {
+          this.subscriber.stopWatching(false);
+          this.callbacks.onBanner(
+            this.activeStreams.size > 0
+              ? "Stream ended — pick another live stream above."
+              : "Waiting for someone to share their screen..."
+          );
+        }
+        this.emitActiveStreamsChange();
         break;
+      }
+
+      case "stream_started":
+        this.activeStreams.set(msg.streamerId, {
+          streamerId: msg.streamerId,
+          nickname: msg.nickname,
+        });
+        if (
+          !this.subscriber.getWatchedStreamerId() &&
+          !this.viewingSelfPreview &&
+          msg.streamerId !== this.viewerId
+        ) {
+          this.subscriber.watch(msg.streamerId, msg.nickname);
+        }
+        this.emitActiveStreamsChange();
+        break;
+
+      case "stream_stopped":
+        this.activeStreams.delete(msg.streamerId);
+        if (this.subscriber.getWatchedStreamerId() === msg.streamerId) {
+          this.subscriber.stopWatching(false);
+          this.callbacks.onBanner(
+            this.activeStreams.size > 0
+              ? "Stream ended — pick another live stream above."
+              : "Waiting for someone to share their screen..."
+          );
+        }
+        this.emitActiveStreamsChange();
+        break;
+
+      case "viewer_watching":
+        if (this.sharing) {
+          void this.publisher.addWatcher(msg.viewerId, msg.nickname || "Viewer");
+        }
+        break;
+
+      case "viewer_unwatching":
+        if (this.sharing) {
+          this.publisher.removeWatcher(msg.viewerId);
+        }
+        break;
+
+      case "signal": {
+        const streamId = msg.streamId || "host";
+        if (streamId === this.viewerId && this.sharing) {
+          void this.publisher.handleSignal(msg.fromId, msg.payload);
+        } else if (streamId === this.subscriber.getWatchedStreamerId()) {
+          void this.subscriber.handleSignal(msg.fromId, msg.payload);
+        }
+        break;
+      }
+
       case "kicked":
         this.leave(msg.reason || "You were removed from the room by the host.", false);
         break;
+
       case "banned":
         this.leave(msg.reason || "You were banned from this room by the host.", false);
         break;
+
       case "room_closed":
         this.leave(msg.reason || "Host ended the stream.", false);
         break;
+
       case "error":
         this.leave(msg.message, false);
         break;
     }
   }
 
-  private async handleSignal(
-    payload: Extract<ServerMessage, { type: "signal" }>["payload"]
-  ): Promise<void> {
-    const pc = this.pc;
-    if (!pc) return;
-
-    try {
-      if (payload.kind === "offer") {
-        await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
-        this.remoteSet = true;
-        for (const cand of this.pendingIce) {
-          await pc.addIceCandidate(new RTCIceCandidate(cand));
-        }
-        this.pendingIce = [];
-
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        this.signaling.send({
-          type: "signal",
-          payload: { kind: "answer", sdp: pc.localDescription! },
-        });
-      } else if (payload.kind === "ice") {
-        if (this.remoteSet) {
-          await pc.addIceCandidate(new RTCIceCandidate(payload.candidate));
-        } else {
-          this.pendingIce.push(payload.candidate);
-        }
-      }
-    } catch (err) {
-      this.leave(`WebRTC negotiation failed: ${String(err)}`);
-    }
-  }
-
-  private startStatsLoop(): void {
-    this.statsTimer = window.setInterval(() => {
-      void this.pollStats();
-    }, 1000);
-  }
-
-  private async pollStats(): Promise<void> {
-    const pc = this.pc;
-    if (!pc || !this.active) return;
-
-    try {
-      const report = await pc.getStats();
-      let width = 0;
-      let height = 0;
-      let fps = 0;
-      let bytesReceived = 0;
-      let timestamp = 0;
-      let packetsReceived = 0;
-      let packetsLost = 0;
-      let codecId = "";
-      let audioBytes = 0;
-      let audioTimestamp = 0;
-      let audioLevel: number | null = null;
-      let hasAudioReport = false;
-      let rttSeconds: number | null = null;
-      const codecs = new Map<string, string>();
-
-      report.forEach((stat) => {
-        if (stat.type === "codec" && stat.mimeType) {
-          codecs.set(stat.id, String(stat.mimeType).replace("video/", ""));
-        } else if (stat.type === "inbound-rtp" && stat.kind === "video") {
-          width = stat.frameWidth ?? 0;
-          height = stat.frameHeight ?? 0;
-          fps = stat.framesPerSecond ?? 0;
-          bytesReceived = stat.bytesReceived ?? 0;
-          timestamp = stat.timestamp ?? 0;
-          packetsReceived = stat.packetsReceived ?? 0;
-          packetsLost = stat.packetsLost ?? 0;
-          codecId = stat.codecId ?? "";
-        } else if (stat.type === "inbound-rtp" && stat.kind === "audio") {
-          hasAudioReport = true;
-          audioBytes = stat.bytesReceived ?? 0;
-          audioTimestamp = stat.timestamp ?? 0;
-          if (typeof stat.audioLevel === "number") {
-            audioLevel = stat.audioLevel;
-          }
-        } else if (
-          stat.type === "candidate-pair" &&
-          stat.state === "succeeded" &&
-          typeof stat.currentRoundTripTime === "number"
-        ) {
-          rttSeconds = stat.currentRoundTripTime;
-        }
-      });
-
-      let bitrateLabel = "-";
-      if (this.prevTimestamp > 0 && timestamp > this.prevTimestamp) {
-        const dtSec = (timestamp - this.prevTimestamp) / 1000;
-        const bps = ((bytesReceived - this.prevBytes) * 8) / dtSec;
-        if (bps >= 1_000_000) {
-          bitrateLabel = `${(bps / 1_000_000).toFixed(2)} Mbps`;
-        } else if (bps > 0) {
-          bitrateLabel = `${Math.round(bps / 1000)} kbps`;
-        }
-      }
-      this.prevBytes = bytesReceived;
-      this.prevTimestamp = timestamp;
-
-      let audioLabel = hasAudioReport ? "Connected" : "No track";
-      if (this.prevAudioTimestamp > 0 && audioTimestamp > this.prevAudioTimestamp) {
-        const dtSec = (audioTimestamp - this.prevAudioTimestamp) / 1000;
-        const kbps = Math.round(((audioBytes - this.prevAudioBytes) * 8) / dtSec / 1000);
-        const loud = audioLevel !== null && audioLevel > 0.002 ? " · Active" : " · Silent";
-        audioLabel = `${kbps} kbps${loud}`;
-      }
-      this.prevAudioBytes = audioBytes;
-      this.prevAudioTimestamp = audioTimestamp;
-
-      const totalPackets = packetsReceived + Math.max(0, packetsLost);
-      const lossPct =
-        totalPackets > 0 ? `${((Math.max(0, packetsLost) / totalPackets) * 100).toFixed(1)}%` : "0.0%";
-
-      this.callbacks.onStats({
-        resolution: width && height ? `${width}×${height}` : "-",
-        fps: fps ? `${Math.round(fps)} fps` : "-",
-        bitrate: bitrateLabel,
-        audio: audioLabel,
-        rtt: rttSeconds !== null ? `${Math.round(rttSeconds * 1000)} ms` : "-",
-        packetLoss: lossPct,
-        codec: codecs.get(codecId) ?? "-",
-        state: pc.connectionState,
-      });
-    } catch {
-      // Ignore transient stats errors
-    }
-  }
-
-  private cleanup(): void {
+  private async cleanup(): Promise<void> {
     this.reconnecting = false;
+    this.sharing = false;
+    this.viewingSelfPreview = false;
     if (this.reconnectTimer !== null) {
       window.clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
-    if (this.statsTimer !== null) {
-      window.clearInterval(this.statsTimer);
-      this.statsTimer = null;
-    }
-    if (this.pc) {
-      this.pc.close();
-      this.pc = null;
-    }
+
+    this.subscriber.stopWatching(false);
+    this.callbacks.onLocalPreviewChange?.(null, false);
     this.signaling.close();
-    this.pendingIce = [];
-    this.remoteSet = false;
+    this.activeStreams.clear();
     this.roomCode = "";
     this.viewerId = "";
     this.viewerToken = "";
+
+    await this.publisher.stop();
   }
 }

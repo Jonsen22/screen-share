@@ -3,10 +3,27 @@ export type SignalPayload =
   | { kind: "answer"; sdp: RTCSessionDescriptionInit }
   | { kind: "ice"; candidate: RTCIceCandidateInit };
 
+export interface ActiveStreamInfo {
+  streamerId: string;
+  nickname: string;
+}
+
 export type ServerMessage =
   | { type: "pong" }
-  | { type: "room_created"; code: string; hostToken?: string; maxViewers: number }
-  | { type: "room_reclaimed"; code: string; maxViewers: number; viewerCount: number }
+  | {
+      type: "room_created";
+      code: string;
+      hostToken?: string;
+      maxViewers: number;
+      activeStreams?: ActiveStreamInfo[];
+    }
+  | {
+      type: "room_reclaimed";
+      code: string;
+      maxViewers: number;
+      viewerCount: number;
+      activeStreams?: ActiveStreamInfo[];
+    }
   | {
       type: "joined_room";
       code: string;
@@ -15,8 +32,14 @@ export type ServerMessage =
       hostNickname?: string;
       viewerCount: number;
       maxViewers: number;
+      activeStreams?: ActiveStreamInfo[];
     }
-  | { type: "reattached"; code: string; viewerId: string }
+  | {
+      type: "reattached";
+      code: string;
+      viewerId: string;
+      activeStreams?: ActiveStreamInfo[];
+    }
   | { type: "viewer_joined"; viewerId: string; nickname?: string; viewerCount: number }
   | {
       type: "viewer_left";
@@ -27,10 +50,14 @@ export type ServerMessage =
       banned?: boolean;
       explicit?: boolean;
     }
+  | { type: "stream_started"; streamerId: string; nickname: string }
+  | { type: "stream_stopped"; streamerId: string }
+  | { type: "viewer_watching"; viewerId: string; nickname?: string; streamerId?: string }
+  | { type: "viewer_unwatching"; viewerId: string; streamerId?: string }
   | { type: "kicked"; reason: string }
   | { type: "banned"; reason: string }
   | { type: "room_closed"; reason: string }
-  | { type: "signal"; fromId: string; payload: SignalPayload }
+  | { type: "signal"; fromId: string; streamId?: string; payload: SignalPayload }
   | { type: "error"; code: string; message: string };
 
 export function normalizeSignalingUrl(raw: string): string {

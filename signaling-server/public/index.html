@@ -92,6 +92,22 @@
 
         <!-- WATCHING STAGE -->
         <section id="viewer-stage" class="viewer-stage hidden">
+          <div id="streams-bar" class="streams-bar">
+            <div class="streams-bar-left">
+              <span class="streams-label">ACTIVE STREAMS</span>
+              <div id="streams-list" class="streams-list" role="tablist" aria-label="Active Streams"></div>
+            </div>
+            <a
+              id="web-share-cta"
+              class="streams-cta"
+              href="https://github.com/Jonsen22/screen-share/releases/latest"
+              target="_blank"
+              rel="noopener"
+            >
+              Want to share your screen too? Download the Windows desktop app
+            </a>
+          </div>
+
           <div id="viewer-video-wrap" class="stage-card viewer-video-card">
             <video id="viewer-video" class="video-surface" autoplay playsinline></video>
 

@@ -22,6 +22,8 @@ const liveStatusBadge = el("live-status-badge");
 const joinTitle = el("join-title");
 const joinSubtitle = el("join-subtitle");
 const viewerError = el("viewer-error");
+const streamsList = el("streams-list");
+const webShareCta = el("web-share-cta");
 const viewerVideoWrap = el("viewer-video-wrap");
 const viewerVideo = el("viewer-video");
 const viewerBanner = el("viewer-banner");
@@ -206,6 +208,8 @@ class WebViewer {
     this.viewerId = "";
     this.viewerToken = "";
     this.nickname = "Viewer";
+    this.activeStreams = new Map();
+    this.watchedStreamerId = null;
     this.prevBytes = 0;
     this.prevTimestamp = 0;
     this.prevAudioBytes = 0;
@@ -235,6 +239,9 @@ class WebViewer {
               viewerId: msg.viewerId,
               viewerToken: msg.viewerToken || "",
               hostNickname: msg.hostNickname || "Host",
+              activeStreams: Array.isArray(msg.activeStreams)
+                ? msg.activeStreams
+                : [{ streamerId: "host", nickname: msg.hostNickname || "Host" }],
             });
           } else if (msg.type === "error") {
             window.clearTimeout(timer);
@@ -250,15 +257,9 @@ class WebViewer {
       this.roomCode = joined.code;
       this.viewerId = joined.viewerId;
       this.viewerToken = joined.viewerToken;
-      this.remoteStream = new MediaStream();
-      this.pendingIce = [];
-      this.remoteSet = false;
-      this.prevBytes = 0;
-      this.prevTimestamp = 0;
-      this.prevAudioBytes = 0;
-      this.prevAudioTimestamp = 0;
+      this.watchedStreamerId = null;
+      this.syncActiveStreams(joined.activeStreams);
 
-      this.setupPeerConnection();
       this.signaling.onMessage((msg) => this.handleServerMessage(msg));
       this.signaling.onClose(() => {
         if (this.active) this.scheduleReattach();
@@ -269,12 +270,139 @@ class WebViewer {
       viewerRoomBadge.textContent = `${joined.hostNickname} · ${joined.code}`;
       viewerJoin.classList.add("hidden");
       viewerStage.classList.remove("hidden");
-      setBanner("Connecting to host...");
       this.startStatsLoop();
+
+      const firstStream = Array.from(this.activeStreams.values())[0];
+      if (firstStream) {
+        this.watchStream(firstStream.streamerId);
+      } else {
+        this.renderStreamsList();
+        setBanner("Waiting for someone to share their screen...");
+      }
     } catch (err) {
       this.cleanup();
       throw err;
     }
+  }
+
+  syncActiveStreams(list) {
+    this.activeStreams.clear();
+    if (Array.isArray(list)) {
+      for (const item of list) {
+        if (item && typeof item.streamerId === "string") {
+          this.activeStreams.set(item.streamerId, {
+            streamerId: item.streamerId,
+            nickname: item.nickname || "Streamer",
+          });
+        }
+      }
+    }
+  }
+
+  renderStreamsList() {
+    streamsList.innerHTML = "";
+    const streams = Array.from(this.activeStreams.values());
+    if (streams.length === 0) {
+      const empty = document.createElement("span");
+      empty.className = "muted";
+      empty.textContent = "No active streams";
+      streamsList.appendChild(empty);
+      viewerRoomBadge.textContent = this.roomCode;
+      return;
+    }
+
+    for (const stream of streams) {
+      const isActive = this.watchedStreamerId === stream.streamerId;
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.role = "tab";
+      btn.className = `stream-pill${isActive ? " active" : ""}`;
+      btn.setAttribute("aria-selected", String(isActive));
+      const dot = document.createElement("span");
+      dot.className = "stream-pill-dot";
+      btn.appendChild(dot);
+      btn.appendChild(document.createTextNode(stream.nickname));
+      btn.addEventListener("click", () => {
+        this.watchStream(stream.streamerId);
+      });
+      streamsList.appendChild(btn);
+    }
+
+    const active = this.watchedStreamerId ? this.activeStreams.get(this.watchedStreamerId) : null;
+    viewerRoomBadge.textContent = active
+      ? `${active.nickname} · ${this.roomCode}`
+      : this.roomCode;
+  }
+
+  watchStream(streamerId) {
+    if (!this.active) return;
+    if (
+      this.watchedStreamerId === streamerId &&
+      this.pc &&
+      this.pc.connectionState !== "failed" &&
+      this.pc.connectionState !== "closed"
+    ) {
+      return;
+    }
+    const info = this.activeStreams.get(streamerId);
+    if (!info) return;
+
+    if (this.watchedStreamerId) {
+      this.stopWatching(true);
+    }
+
+    this.watchedStreamerId = streamerId;
+    this.remoteStream = new MediaStream();
+    this.pendingIce = [];
+    this.remoteSet = false;
+    this.prevBytes = 0;
+    this.prevTimestamp = 0;
+    this.prevAudioBytes = 0;
+    this.prevAudioTimestamp = 0;
+
+    this.setupPeerConnection(info.nickname);
+    this.renderStreamsList();
+    setBanner(`Connecting to ${info.nickname}'s stream...`);
+
+    try {
+      this.signaling.send({ type: "watch_stream", streamerId });
+    } catch {
+      // Ignore if socket temporarily disconnected
+    }
+  }
+
+  stopWatching(notifyServer = true) {
+    const prevId = this.watchedStreamerId;
+    this.watchedStreamerId = null;
+
+    if (notifyServer && prevId) {
+      try {
+        this.signaling.send({ type: "stop_watching", streamerId: prevId });
+      } catch {
+        // Ignore
+      }
+    }
+
+    if (this.pc) {
+      const old = this.pc;
+      this.pc = null;
+      old.ontrack = null;
+      old.onicecandidate = null;
+      old.onconnectionstatechange = null;
+      try {
+        old.close();
+      } catch {
+        // Ignore
+      }
+    }
+    this.pendingIce = [];
+    this.remoteSet = false;
+    this.prevBytes = 0;
+    this.prevTimestamp = 0;
+    this.prevAudioBytes = 0;
+    this.prevAudioTimestamp = 0;
+    viewerVideo.srcObject = null;
+    btnUnmuteOverlay.classList.add("hidden");
   }
 
   scheduleReattach(delayMs = 3000) {
@@ -338,11 +466,12 @@ class WebViewer {
     if (reason) showError(reason);
   }
 
-  setupPeerConnection() {
+  setupPeerConnection(streamerNickname = "host") {
     const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
     this.pc = pc;
 
     pc.ontrack = (event) => {
+      if (this.pc !== pc) return;
       const stream = event.streams[0] || this.remoteStream;
       if (!event.streams[0]) {
         this.remoteStream.addTrack(event.track);
@@ -361,10 +490,13 @@ class WebViewer {
     };
 
     pc.onicecandidate = (event) => {
-      if (event.candidate) {
+      if (this.pc !== pc) return;
+      if (event.candidate && this.watchedStreamerId) {
         try {
           this.signaling.send({
             type: "signal",
+            targetId: this.watchedStreamerId,
+            streamId: this.watchedStreamerId,
             payload: { kind: "ice", candidate: event.candidate.toJSON() },
           });
         } catch {
@@ -374,24 +506,64 @@ class WebViewer {
     };
 
     pc.onconnectionstatechange = () => {
+      if (this.pc !== pc) return;
       const state = pc.connectionState;
       if (state === "connected") {
         setBanner(null);
       } else if (state === "connecting") {
-        setBanner("Connecting to host...");
+        setBanner(`Connecting to ${streamerNickname}'s stream...`);
       } else if (state === "disconnected") {
         setBanner("Connection interrupted — reconnecting...");
       } else if (state === "failed") {
-        this.leave("Host ended the stream or peer connection failed.", false);
+        setBanner("Stream connection failed. Click a live stream above to retry.");
       }
     };
   }
 
   handleServerMessage(msg) {
     switch (msg.type) {
-      case "signal":
-        void this.handleSignal(msg.payload);
+      case "reattached":
+        this.syncActiveStreams(msg.activeStreams);
+        if (this.watchedStreamerId && !this.activeStreams.has(this.watchedStreamerId)) {
+          this.stopWatching(false);
+          setBanner(
+            this.activeStreams.size > 0
+              ? "Stream ended — pick another live stream above."
+              : "Waiting for someone to share their screen..."
+          );
+        }
+        this.renderStreamsList();
         break;
+      case "stream_started":
+        this.activeStreams.set(msg.streamerId, {
+          streamerId: msg.streamerId,
+          nickname: msg.nickname || "Streamer",
+        });
+        if (!this.watchedStreamerId) {
+          this.watchStream(msg.streamerId);
+        } else {
+          this.renderStreamsList();
+        }
+        break;
+      case "stream_stopped":
+        this.activeStreams.delete(msg.streamerId);
+        if (this.watchedStreamerId === msg.streamerId) {
+          this.stopWatching(false);
+          setBanner(
+            this.activeStreams.size > 0
+              ? "Stream ended — pick another live stream above."
+              : "Waiting for someone to share their screen..."
+          );
+        }
+        this.renderStreamsList();
+        break;
+      case "signal": {
+        const streamId = msg.streamId || "host";
+        if (streamId === this.watchedStreamerId) {
+          void this.handleSignal(msg.fromId, msg.payload);
+        }
+        break;
+      }
       case "kicked":
         this.leave(msg.reason || "You were removed from the room by the host.", false);
         break;
@@ -407,9 +579,9 @@ class WebViewer {
     }
   }
 
-  async handleSignal(payload) {
+  async handleSignal(fromId, payload) {
     const pc = this.pc;
-    if (!pc) return;
+    if (!pc || fromId !== this.watchedStreamerId) return;
     try {
       if (payload.kind === "offer") {
         await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
@@ -422,6 +594,8 @@ class WebViewer {
         await pc.setLocalDescription(answer);
         this.signaling.send({
           type: "signal",
+          targetId: fromId,
+          streamId: fromId,
           payload: { kind: "answer", sdp: pc.localDescription },
         });
       } else if (payload.kind === "ice") {
@@ -432,7 +606,7 @@ class WebViewer {
         }
       }
     } catch (err) {
-      this.leave(`WebRTC negotiation failed: ${String(err)}`, false);
+      setBanner(`WebRTC negotiation failed: ${String(err)}`);
     }
   }
 
@@ -545,6 +719,8 @@ class WebViewer {
       this.pc = null;
     }
     this.signaling.close();
+    this.activeStreams.clear();
+    this.watchedStreamerId = null;
     this.pendingIce = [];
     this.remoteSet = false;
     this.roomCode = "";
@@ -583,6 +759,7 @@ if (ctxEl && ctxEl.textContent) {
 if (ctx) {
   if (ctx.downloadUrl) {
     downloadDesktopLink.href = ctx.downloadUrl;
+    webShareCta.href = ctx.downloadUrl;
   }
   if (ctx.code) {
     roomCodeInput.value = ctx.code;
