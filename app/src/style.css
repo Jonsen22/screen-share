@@ -322,7 +322,7 @@ body {
 
 .form-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 14px;
 }
 
@@ -330,6 +330,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  min-width: 0;
 }
 
 .field-label-row {
@@ -349,6 +350,9 @@ body {
 
 .field select,
 .field input[type="text"] {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 7px;
@@ -356,6 +360,7 @@ body {
   padding: 9px 11px;
   font-size: 13px;
   font-family: inherit;
+  text-overflow: ellipsis;
 }
 
 .field select:focus,
@@ -1032,7 +1037,7 @@ body {
 }
 
 .modal-card-wide {
-  max-width: 480px;
+  max-width: 560px;
 }
 
 .intro-head {
