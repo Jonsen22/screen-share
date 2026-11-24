@@ -4,8 +4,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
-import { RateLimiter, extractClientIp } from "./rate-limiter.mjs";
+import { RateLimiter, extractClientIp, maskIp } from "./rate-limiter.mjs";
 
+const SERVER_STARTED_AT = Date.now();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "public");
 const WEB_INDEX_HTML = fs.readFileSync(path.join(PUBLIC_DIR, "index.html"), "utf8");
@@ -26,6 +27,22 @@ const APP_DOWNLOAD_URL = (
   process.env.APP_DOWNLOAD_URL || "https://github.com/Jonsen22/screen-share/releases/latest"
 ).trim();
 const APP_RELEASE_NOTES = (process.env.APP_RELEASE_NOTES || "").trim();
+const ADMIN_PASSWORD = (process.env.ADMIN_PASSWORD || "").trim();
+const ADMIN_USERNAME = (process.env.ADMIN_USERNAME || "").trim();
+const ALLOWED_ORIGINS = new Set(
+  (process.env.ALLOWED_ORIGINS || "")
+    .split(",")
+    .map((s) => s.trim().replace(/\/+$/, "").toLowerCase())
+    .filter(Boolean)
+);
+
+const BASE_SECURITY_HEADERS = {
+  "X-Frame-Options": "DENY",
+  "X-Content-Type-Options": "nosniff",
+  "Referrer-Policy": "no-referrer",
+};
+const HTML_CSP =
+  "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self' ws: wss:; media-src 'self' blob: mediastream:; img-src 'self' data:; font-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 
 const limiter = new RateLimiter({
   maxActiveRoomsPerIp: process.env.MAX_ACTIVE_ROOMS_PER_IP,
@@ -36,6 +53,12 @@ const limiter = new RateLimiter({
   maxFailedJoins: process.env.MAX_FAILED_JOINS,
   failedJoinWindowMs: process.env.FAILED_JOIN_WINDOW_MS,
   failedJoinBlockMs: process.env.FAILED_JOIN_BLOCK_MS,
+  maxFailedReclaims: process.env.MAX_FAILED_RECLAIMS,
+  failedReclaimWindowMs: process.env.FAILED_RECLAIM_WINDOW_MS,
+  failedReclaimBlockMs: process.env.FAILED_RECLAIM_BLOCK_MS,
+  maxAdminAuthFails: process.env.MAX_ADMIN_AUTH_FAILS,
+  adminAuthWindowMs: process.env.ADMIN_AUTH_WINDOW_MS,
+  adminAuthBlockMs: process.env.ADMIN_AUTH_BLOCK_MS,
   maxWsPerIp: process.env.MAX_WS_PER_IP,
   maxWsMessages: process.env.MAX_WS_MESSAGES,
   wsMessageWindowMs: process.env.WS_MESSAGE_WINDOW_MS,
@@ -50,14 +73,61 @@ const limiter = new RateLimiter({
  *   hostToken: string,
  *   hostNickname: string,
  *   hostGraceTimer: NodeJS.Timeout | null,
- *   viewers: Map<string, { ws: WebSocket, nickname: string }>,
+ *   viewers: Map<string, { ws: WebSocket, nickname: string, ip: string, viewerToken: string }>,
  *   viewerGraceTimers: Map<string, NodeJS.Timeout>,
+ *   bannedIps: Set<string>,
  *   createdAt: number
  * }} Room
  */
 
 /** @type {Map<string, Room>} */
 const rooms = new Map();
+
+function timingSafeEqualStr(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const hashA = crypto.createHash("sha256").update(a, "utf8").digest();
+  const hashB = crypto.createHash("sha256").update(b, "utf8").digest();
+  return crypto.timingSafeEqual(hashA, hashB);
+}
+
+function isAllowedWsOrigin(req) {
+  const rawOrigin = req?.headers?.origin;
+  if (!rawOrigin || typeof rawOrigin !== "string" || !rawOrigin.trim()) {
+    return true;
+  }
+
+  const normalized = rawOrigin.trim().replace(/\/+$/, "").toLowerCase();
+  let url;
+  try {
+    url = new URL(normalized);
+  } catch {
+    return false;
+  }
+
+  if (ALLOWED_ORIGINS.has(normalized)) {
+    return true;
+  }
+  if (
+    normalized === "tauri://localhost" ||
+    normalized === "http://tauri.localhost" ||
+    normalized === "https://tauri.localhost"
+  ) {
+    return true;
+  }
+  if (
+    (url.protocol === "http:" || url.protocol === "https:") &&
+    (url.hostname === "localhost" || url.hostname === "127.0.0.1")
+  ) {
+    return true;
+  }
+  if (url.protocol === "http:" || url.protocol === "https:") {
+    const reqHost = String(req?.headers?.host || "").trim().toLowerCase();
+    if (reqHost && url.host.toLowerCase() === reqHost) {
+      return true;
+    }
+  }
+  return false;
+}
 
 function sanitizeNickname(input, fallback) {
   if (typeof input !== "string") return fallback;
@@ -245,7 +315,7 @@ function renderWebViewerPage(code, room) {
     downloadUrl: APP_DOWNLOAD_URL,
   };
   const safeJson = JSON.stringify(joinContext).replace(/</g, "\\u003c");
-  const contextScript = `<script>window.__JOIN_CONTEXT__ = ${safeJson};</script>`;
+  const contextScript = `<script id="join-context" type="application/json">${safeJson}</script>`;
 
   return WEB_INDEX_HTML.replace("<!--OG_META-->", ogMeta).replace(
     "<!--JOIN_CONTEXT-->",
@@ -258,6 +328,7 @@ const server = http.createServer((req, res) => {
   const httpCheck = limiter.checkHttpRequest(ip);
   if (!httpCheck.allowed) {
     res.writeHead(429, {
+      ...BASE_SECURITY_HEADERS,
       "Content-Type": "text/plain; charset=utf-8",
       "Retry-After": String(httpCheck.retryAfterSec),
     });
@@ -268,22 +339,17 @@ const server = http.createServer((req, res) => {
   const reqPath = (req.url || "/").split("?")[0];
   if (reqPath === "/health") {
     res.writeHead(200, {
+      ...BASE_SECURITY_HEADERS,
       "Content-Type": "application/json",
       "Access-Control-Allow-Origin": "*",
       "Cache-Control": "no-store",
     });
-    res.end(
-      JSON.stringify({
-        status: "ok",
-        version: LATEST_APP_VERSION,
-        rooms: rooms.size,
-        maxViewers: MAX_VIEWERS,
-      })
-    );
+    res.end(JSON.stringify({ status: "ok" }));
     return;
   }
   if (reqPath === "/version") {
     res.writeHead(200, {
+      ...BASE_SECURITY_HEADERS,
       "Content-Type": "application/json",
       "Access-Control-Allow-Origin": "*",
       "Cache-Control": "no-store",
@@ -297,8 +363,112 @@ const server = http.createServer((req, res) => {
     );
     return;
   }
+  if (reqPath === "/admin/status") {
+    if (!ADMIN_PASSWORD) {
+      res.writeHead(503, {
+        ...BASE_SECURITY_HEADERS,
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+      });
+      res.end(JSON.stringify({ error: "Admin endpoint is not configured." }));
+      return;
+    }
+
+    const authRateCheck = limiter.checkAdminAuthAllowed(ip);
+    if (!authRateCheck.allowed) {
+      res.writeHead(429, {
+        ...BASE_SECURITY_HEADERS,
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+        "Retry-After": String(authRateCheck.retryAfterSec),
+      });
+      res.end(JSON.stringify({ error: "Too many failed admin authentication attempts." }));
+      return;
+    }
+
+    const authHeader = typeof req.headers.authorization === "string" ? req.headers.authorization : "";
+    if (!authHeader.trim()) {
+      res.writeHead(401, {
+        ...BASE_SECURITY_HEADERS,
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+        "WWW-Authenticate": 'Basic realm="screen-share admin"',
+      });
+      res.end(JSON.stringify({ error: "Authentication required." }));
+      return;
+    }
+
+    let validAuth = false;
+    const match = /^Basic\s+(.+)$/i.exec(authHeader.trim());
+    if (match) {
+      const decoded = Buffer.from(match[1], "base64").toString("utf8");
+      const sepIdx = decoded.indexOf(":");
+      if (sepIdx >= 0) {
+        const providedUser = decoded.slice(0, sepIdx);
+        const providedPass = decoded.slice(sepIdx + 1);
+        const passOk = timingSafeEqualStr(providedPass, ADMIN_PASSWORD);
+        const userOk = ADMIN_USERNAME ? timingSafeEqualStr(providedUser, ADMIN_USERNAME) : true;
+        validAuth = passOk && userOk;
+      }
+    }
+
+    if (!validAuth) {
+      limiter.recordFailedAdminAuth(ip);
+      res.writeHead(401, {
+        ...BASE_SECURITY_HEADERS,
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+        "WWW-Authenticate": 'Basic realm="screen-share admin"',
+      });
+      res.end(JSON.stringify({ error: "Invalid credentials." }));
+      return;
+    }
+
+    const now = Date.now();
+    const roomSummaries = [];
+    for (const [code, room] of rooms.entries()) {
+      const viewerSummaries = [];
+      for (const [viewerId, v] of room.viewers.entries()) {
+        viewerSummaries.push({
+          viewerId,
+          nickname: v.nickname,
+          maskedIp: maskIp(v.ip),
+        });
+      }
+      roomSummaries.push({
+        code,
+        uptimeSec: Math.max(0, Math.floor((now - room.createdAt) / 1000)),
+        host: {
+          nickname: room.hostNickname,
+          connected: Boolean(room.host),
+          maskedIp: maskIp(room.hostIp),
+        },
+        viewerCount: room.viewers.size,
+        viewers: viewerSummaries,
+        bannedIpCount: room.bannedIps.size,
+      });
+    }
+
+    res.writeHead(200, {
+      ...BASE_SECURITY_HEADERS,
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+    });
+    res.end(
+      JSON.stringify({
+        status: "ok",
+        uptimeSec: Math.max(0, Math.floor((now - SERVER_STARTED_AT) / 1000)),
+        startedAt: new Date(SERVER_STARTED_AT).toISOString(),
+        activeRoomCount: rooms.size,
+        maxGlobalRooms: limiter.maxGlobalRooms,
+        rooms: roomSummaries,
+      })
+    );
+    return;
+  }
   if (reqPath === "/style.css") {
     res.writeHead(200, {
+      ...BASE_SECURITY_HEADERS,
       "Content-Type": "text/css; charset=utf-8",
       "Cache-Control": "public, max-age=300",
     });
@@ -307,6 +477,7 @@ const server = http.createServer((req, res) => {
   }
   if (reqPath === "/viewer.js") {
     res.writeHead(200, {
+      ...BASE_SECURITY_HEADERS,
       "Content-Type": "application/javascript; charset=utf-8",
       "Cache-Control": "public, max-age=300",
     });
@@ -315,6 +486,8 @@ const server = http.createServer((req, res) => {
   }
   if (reqPath === "/" || reqPath === "/watch") {
     res.writeHead(200, {
+      ...BASE_SECURITY_HEADERS,
+      "Content-Security-Policy": HTML_CSP,
       "Content-Type": "text/html; charset=utf-8",
       "Cache-Control": "no-store",
     });
@@ -322,22 +495,40 @@ const server = http.createServer((req, res) => {
     return;
   }
   if (reqPath.startsWith("/join/")) {
-    const rawCode = decodeURIComponent(reqPath.slice("/join/".length));
+    let rawCode = "";
+    try {
+      rawCode = decodeURIComponent(reqPath.slice("/join/".length));
+    } catch {
+      res.writeHead(400, {
+        ...BASE_SECURITY_HEADERS,
+        "Content-Type": "text/plain; charset=utf-8",
+      });
+      res.end("Invalid room code.\n");
+      return;
+    }
     const code = normalizeCode(rawCode);
     if (!isValidNormalizedCode(code)) {
-      res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+      res.writeHead(400, {
+        ...BASE_SECURITY_HEADERS,
+        "Content-Type": "text/plain; charset=utf-8",
+      });
       res.end("Invalid room code.\n");
       return;
     }
     const room = rooms.get(code) || null;
     res.writeHead(200, {
+      ...BASE_SECURITY_HEADERS,
+      "Content-Security-Policy": HTML_CSP,
       "Content-Type": "text/html; charset=utf-8",
       "Cache-Control": "no-store",
     });
     res.end(renderWebViewerPage(code, room));
     return;
   }
-  res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+  res.writeHead(404, {
+    ...BASE_SECURITY_HEADERS,
+    "Content-Type": "text/plain; charset=utf-8",
+  });
   res.end("Not found\n");
 });
 
@@ -347,6 +538,17 @@ const wss = new WebSocketServer({
 });
 
 server.on("upgrade", (req, socket, head) => {
+  if (!isAllowedWsOrigin(req)) {
+    socket.write(
+      "HTTP/1.1 403 Forbidden\r\n" +
+        "Content-Type: text/plain\r\n" +
+        "Connection: close\r\n\r\n" +
+        "Forbidden origin.\r\n"
+    );
+    socket.destroy();
+    return;
+  }
+
   const ip = extractClientIp(req);
   if (!limiter.tryAcquireWs(ip)) {
     socket.write(
@@ -435,6 +637,7 @@ wss.on("connection", (ws) => {
           hostGraceTimer: null,
           viewers: new Map(),
           viewerGraceTimers: new Map(),
+          bannedIps: new Set(),
           createdAt: Date.now(),
         });
         ws._meta = { role: "host", code, nickname: hostNickname };
@@ -449,10 +652,22 @@ wss.on("connection", (ws) => {
       }
 
       case "reclaim_room": {
+        const ip = ws._clientIp || "unknown";
+        const reclaimCheck = limiter.checkReclaimAllowed(ip);
+        if (!reclaimCheck.allowed) {
+          sendJson(ws, {
+            type: "error",
+            code: reclaimCheck.code,
+            message: reclaimCheck.message,
+          });
+          return;
+        }
+
         const code = normalizeCode(msg.code);
         const hostToken = typeof msg.hostToken === "string" ? msg.hostToken : "";
         const hostNickname = sanitizeNickname(msg.nickname, "Host");
         if (!isValidNormalizedCode(code) || hostToken.length < 16) {
+          limiter.recordFailedReclaim(ip);
           sendJson(ws, {
             type: "error",
             code: "INVALID_RECLAIM",
@@ -463,7 +678,8 @@ wss.on("connection", (ws) => {
 
         const existing = rooms.get(code);
         if (existing) {
-          if (existing.hostToken !== hostToken) {
+          if (!timingSafeEqualStr(existing.hostToken, hostToken)) {
+            limiter.recordFailedReclaim(ip);
             sendJson(ws, {
               type: "error",
               code: "RECLAIM_DENIED",
@@ -484,7 +700,7 @@ wss.on("connection", (ws) => {
             }
           }
           existing.host = ws;
-          existing.hostIp = ws._clientIp || existing.hostIp;
+          existing.hostIp = ip;
           ws._meta = { role: "host", code, nickname: existing.hostNickname };
           sendJson(ws, {
             type: "room_reclaimed",
@@ -495,22 +711,24 @@ wss.on("connection", (ws) => {
           console.log(`[room ${code}] reclaimed by ${existing.hostNickname}`);
         } else {
           // Server restarted while host was still streaming P2P; recreate room with same code.
-          if (rooms.size >= limiter.maxGlobalRooms) {
+          const createCheck = limiter.checkCreateRoom(ip, rooms);
+          if (!createCheck.allowed) {
             sendJson(ws, {
               type: "error",
-              code: "SERVER_BUSY",
-              message: "Server is currently at room capacity.",
+              code: createCheck.code,
+              message: createCheck.message,
             });
             return;
           }
           rooms.set(code, {
             host: ws,
-            hostIp: ws._clientIp || "unknown",
+            hostIp: ip,
             hostToken,
             hostNickname,
             hostGraceTimer: null,
             viewers: new Map(),
             viewerGraceTimers: new Map(),
+            bannedIps: new Set(),
             createdAt: Date.now(),
           });
           ws._meta = { role: "host", code, nickname: hostNickname };
@@ -541,6 +759,12 @@ wss.on("connection", (ws) => {
         const target = room.viewers.get(targetId);
         if (!target) return;
 
+        const pendingTimer = room.viewerGraceTimers.get(targetId);
+        if (pendingTimer) {
+          clearTimeout(pendingTimer);
+          room.viewerGraceTimers.delete(targetId);
+        }
+
         room.viewers.delete(targetId);
         target.ws._meta = null;
         sendJson(target.ws, {
@@ -561,6 +785,49 @@ wss.on("connection", (ws) => {
         });
         console.log(
           `[room ${meta.code}] viewer ${targetId} (${target.nickname}) kicked (${room.viewers.size}/${MAX_VIEWERS})`
+        );
+        break;
+      }
+
+      case "ban_viewer": {
+        const meta = ws._meta;
+        if (!meta || meta.role !== "host") return;
+        const room = rooms.get(meta.code);
+        if (!room) return;
+        const targetId = typeof msg.targetId === "string" ? msg.targetId : "";
+        const target = room.viewers.get(targetId);
+        if (!target) return;
+
+        const pendingTimer = room.viewerGraceTimers.get(targetId);
+        if (pendingTimer) {
+          clearTimeout(pendingTimer);
+          room.viewerGraceTimers.delete(targetId);
+        }
+
+        if (target.ip && target.ip !== "unknown") {
+          room.bannedIps.add(target.ip);
+        }
+        room.viewers.delete(targetId);
+        target.ws._meta = null;
+        sendJson(target.ws, {
+          type: "banned",
+          reason: "You were banned from this room by the host.",
+        });
+        try {
+          target.ws.close(4002, "Banned by host");
+        } catch {
+          // Ignore close errors
+        }
+        sendJson(room.host, {
+          type: "viewer_left",
+          viewerId: targetId,
+          nickname: target.nickname,
+          viewerCount: room.viewers.size,
+          kicked: true,
+          banned: true,
+        });
+        console.log(
+          `[room ${meta.code}] viewer ${targetId} (${target.nickname}) banned (${room.viewers.size}/${MAX_VIEWERS})`
         );
         break;
       }
@@ -589,6 +856,14 @@ wss.on("connection", (ws) => {
           });
           return;
         }
+        if (room.bannedIps.has(ip)) {
+          sendJson(ws, {
+            type: "error",
+            code: "BANNED_FROM_ROOM",
+            message: "You are banned from this room.",
+          });
+          return;
+        }
         if (room.viewers.size >= MAX_VIEWERS) {
           sendJson(ws, {
             type: "error",
@@ -599,14 +874,16 @@ wss.on("connection", (ws) => {
         }
 
         const viewerId = crypto.randomUUID().slice(0, 8);
+        const viewerToken = crypto.randomBytes(16).toString("hex");
         const nickname = sanitizeNickname(msg.nickname, "Viewer");
-        room.viewers.set(viewerId, { ws, nickname });
+        room.viewers.set(viewerId, { ws, nickname, ip, viewerToken });
         ws._meta = { role: "viewer", code, viewerId, nickname };
 
         sendJson(ws, {
           type: "joined_room",
           code,
           viewerId,
+          viewerToken,
           hostNickname: room.hostNickname,
           viewerCount: room.viewers.size,
           maxViewers: MAX_VIEWERS,
@@ -624,20 +901,59 @@ wss.on("connection", (ws) => {
       }
 
       case "reattach_viewer": {
+        const ip = ws._clientIp || "unknown";
         const code = normalizeCode(msg.code);
         const viewerId = typeof msg.viewerId === "string" ? msg.viewerId : "";
+        const viewerToken = typeof msg.viewerToken === "string" ? msg.viewerToken : "";
         const room = rooms.get(code);
         if (!room || !viewerId) return;
+
+        if (room.bannedIps.has(ip)) {
+          sendJson(ws, {
+            type: "error",
+            code: "BANNED_FROM_ROOM",
+            message: "You are banned from this room.",
+          });
+          try {
+            ws.close(4003, "Banned from room");
+          } catch {
+            // Ignore close errors
+          }
+          return;
+        }
+
+        const existing = room.viewers.get(viewerId);
+        if (!existing || !viewerToken || !timingSafeEqualStr(existing.viewerToken, viewerToken)) {
+          sendJson(ws, {
+            type: "error",
+            code: "REATTACH_DENIED",
+            message: "Invalid viewer session token.",
+          });
+          return;
+        }
+
         const pending = room.viewerGraceTimers.get(viewerId);
         if (pending) {
           clearTimeout(pending);
           room.viewerGraceTimers.delete(viewerId);
         }
-        const existing = room.viewers.get(viewerId);
-        if (!existing && room.viewers.size >= MAX_VIEWERS) return;
-        const nickname = existing?.nickname || sanitizeNickname(msg.nickname, "Viewer");
-        room.viewers.set(viewerId, { ws, nickname });
-        ws._meta = { role: "viewer", code, viewerId, nickname };
+
+        if (existing.ws && existing.ws !== ws) {
+          existing.ws._meta = null;
+          try {
+            existing.ws.close();
+          } catch {
+            // Ignore close errors
+          }
+        }
+
+        room.viewers.set(viewerId, {
+          ws,
+          nickname: existing.nickname,
+          ip,
+          viewerToken: existing.viewerToken,
+        });
+        ws._meta = { role: "viewer", code, viewerId, nickname: existing.nickname };
         sendJson(ws, { type: "reattached", code, viewerId });
         break;
       }

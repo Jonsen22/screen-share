@@ -204,6 +204,7 @@ class WebViewer {
     this.reconnecting = false;
     this.roomCode = "";
     this.viewerId = "";
+    this.viewerToken = "";
     this.nickname = "Viewer";
     this.prevBytes = 0;
     this.prevTimestamp = 0;
@@ -232,6 +233,7 @@ class WebViewer {
             resolve({
               code: msg.code,
               viewerId: msg.viewerId,
+              viewerToken: msg.viewerToken || "",
               hostNickname: msg.hostNickname || "Host",
             });
           } else if (msg.type === "error") {
@@ -247,6 +249,7 @@ class WebViewer {
       this.active = true;
       this.roomCode = joined.code;
       this.viewerId = joined.viewerId;
+      this.viewerToken = joined.viewerToken;
       this.remoteStream = new MediaStream();
       this.pendingIce = [];
       this.remoteSet = false;
@@ -294,6 +297,7 @@ class WebViewer {
           type: "reattach_viewer",
           code: this.roomCode,
           viewerId: this.viewerId,
+          viewerToken: this.viewerToken,
           nickname: this.nickname,
         });
         this.reconnecting = false;
@@ -390,6 +394,9 @@ class WebViewer {
         break;
       case "kicked":
         this.leave(msg.reason || "You were removed from the room by the host.", false);
+        break;
+      case "banned":
+        this.leave(msg.reason || "You were banned from this room by the host.", false);
         break;
       case "room_closed":
         this.leave(msg.reason || "Host ended the stream.", false);
@@ -542,6 +549,7 @@ class WebViewer {
     this.remoteSet = false;
     this.roomCode = "";
     this.viewerId = "";
+    this.viewerToken = "";
   }
 }
 
@@ -563,7 +571,15 @@ if (savedNick) {
 }
 
 // Apply injected /join/<CODE> context if present
-const ctx = window.__JOIN_CONTEXT__ || null;
+let ctx = null;
+const ctxEl = document.getElementById("join-context");
+if (ctxEl && ctxEl.textContent) {
+  try {
+    ctx = JSON.parse(ctxEl.textContent);
+  } catch {
+    ctx = null;
+  }
+}
 if (ctx) {
   if (ctx.downloadUrl) {
     downloadDesktopLink.href = ctx.downloadUrl;

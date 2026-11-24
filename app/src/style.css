@@ -843,20 +843,44 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+}
+
+.viewer-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
 }
 
 .btn-kick {
   padding: 3px 9px;
   font-size: 11px;
-  background: rgba(218, 55, 60, 0.14);
-  border-color: rgba(218, 55, 60, 0.45);
-  color: #ff9a9e;
+  background: rgba(240, 178, 50, 0.14);
+  border-color: rgba(240, 178, 50, 0.45);
+  color: #f5d68a;
   flex-shrink: 0;
 }
 
 .btn-kick:hover:not(:disabled) {
+  background: #d99b1e;
+  border-color: #d99b1e;
+  color: #111;
+}
+
+.btn-ban {
+  padding: 3px 9px;
+  font-size: 11px;
   background: var(--danger);
   border-color: var(--danger);
+  color: #fff;
+  flex-shrink: 0;
+}
+
+.btn-ban:hover:not(:disabled) {
+  background: var(--danger-hover);
+  border-color: var(--danger-hover);
   color: #fff;
 }
 

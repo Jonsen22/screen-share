@@ -11,6 +11,7 @@ export type ServerMessage =
       type: "joined_room";
       code: string;
       viewerId: string;
+      viewerToken?: string;
       hostNickname?: string;
       viewerCount: number;
       maxViewers: number;
@@ -23,9 +24,11 @@ export type ServerMessage =
       nickname?: string;
       viewerCount: number;
       kicked?: boolean;
+      banned?: boolean;
       explicit?: boolean;
     }
   | { type: "kicked"; reason: string }
+  | { type: "banned"; reason: string }
   | { type: "room_closed"; reason: string }
   | { type: "signal"; fromId: string; payload: SignalPayload }
   | { type: "error"; code: string; message: string };

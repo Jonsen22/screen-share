@@ -473,6 +473,24 @@
           </form>
         </div>
       </div>
+
+      <!-- BAN VIEWER CONFIRMATION MODAL -->
+      <div id="ban-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="ban-modal-title">
+        <div class="modal-card">
+          <h2 id="ban-modal-title">Ban Viewer?</h2>
+          <p class="muted small">
+            Are you sure you want to ban <strong id="ban-modal-nickname">this viewer</strong>? They will be removed immediately and their IP address will be blocked from rejoining for the rest of this room session.
+          </p>
+          <div class="actions-row">
+            <button id="btn-ban-cancel" class="btn btn-ghost" type="button">
+              Cancel
+            </button>
+            <button id="btn-ban-confirm" class="btn btn-danger" type="button">
+              Ban Viewer
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
 
     <script type="module" src="/src/main.ts"></script>

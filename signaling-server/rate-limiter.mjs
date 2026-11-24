@@ -1,19 +1,92 @@
+import net from "node:net";
+
 /**
  * In-memory anti-DoS & abuse rate limiter for the screen-share signaling server.
  * Zero external dependencies; auto-sweeps expired entries to prevent memory leaks.
  */
 
-export function extractClientIp(req) {
-  const xff = req?.headers?.["x-forwarded-for"];
-  let raw = "";
-  if (typeof xff === "string" && xff.trim()) {
-    raw = xff.split(",")[0].trim();
-  } else if (Array.isArray(xff) && xff.length > 0) {
-    raw = String(xff[0]).split(",")[0].trim();
-  } else {
-    raw = String(req?.socket?.remoteAddress || "unknown");
+function firstHeaderValue(value) {
+  if (typeof value === "string") {
+    const first = value
+      .split(",")
+      .map((part) => part.trim())
+      .find(Boolean);
+    return first || "";
   }
-  return raw.replace(/^::ffff:/i, "") || "unknown";
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const first = String(item || "")
+        .split(",")
+        .map((part) => part.trim())
+        .find(Boolean);
+      if (first) return first;
+    }
+  }
+  return "";
+}
+
+function normalizeIpString(raw) {
+  if (typeof raw !== "string") return "";
+  let cleaned = raw.trim();
+  if (!cleaned) return "";
+
+  // Strip bracketed IPv6 with optional :port (e.g. "[2001:db8::1]:443")
+  const bracketMatch = /^\[([^\]]+)\](?::\d+)?$/.exec(cleaned);
+  if (bracketMatch) {
+    cleaned = bracketMatch[1].trim();
+  }
+
+  // Strip ::ffff: prefix ONLY for dotted-quad IPv4-mapped forms so hex IPv4-mapped
+  // IPv6 addresses (e.g. "::ffff:c0a8:0101") remain valid IPv6.
+  cleaned = cleaned.replace(/^::ffff:(?=\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?::\d+)?$)/i, "");
+
+  // Strip optional :port on dotted-quad IPv4 (e.g. "192.168.1.100:54321")
+  const v4PortMatch = /^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(?::\d+)?$/.exec(cleaned);
+  if (v4PortMatch) {
+    cleaned = v4PortMatch[1];
+  }
+
+  return cleaned;
+}
+
+export function extractClientIp(req) {
+  const headers = req?.headers || {};
+  const raw =
+    firstHeaderValue(headers["cf-connecting-ip"]) ||
+    firstHeaderValue(headers["true-client-ip"]) ||
+    firstHeaderValue(headers["x-forwarded-for"]) ||
+    String(req?.socket?.remoteAddress || "").trim();
+  return normalizeIpString(raw) || "unknown";
+}
+
+export function maskIp(ip) {
+  if (typeof ip !== "string") return "unknown";
+  const cleaned = normalizeIpString(ip);
+  if (!cleaned || cleaned === "unknown") return "unknown";
+
+  if (net.isIPv4(cleaned)) {
+    const [a, b] = cleaned.split(".");
+    return `${a}.${b}.xxx.xxx`;
+  }
+
+  const withoutZone = cleaned.split("%")[0];
+  if (net.isIPv6(withoutZone)) {
+    let hextets;
+    if (withoutZone.includes("::")) {
+      const [leftPart, rightPart] = withoutZone.split("::");
+      const left = leftPart ? leftPart.split(":").filter(Boolean) : [];
+      const right = rightPart ? rightPart.split(":").filter(Boolean) : [];
+      const missing = Math.max(0, 8 - left.length - right.length);
+      hextets = [...left, ...Array(missing).fill("0"), ...right];
+    } else {
+      hextets = withoutZone.split(":");
+    }
+    const h0 = (hextets[0] || "0").toLowerCase();
+    const h1 = (hextets[1] || "0").toLowerCase();
+    return `${h0}:${h1}::xxxx`;
+  }
+
+  return "unknown";
 }
 
 export function formatRemaining(ms) {
@@ -38,6 +111,14 @@ export class RateLimiter {
     this.failedJoinWindowMs = Number(options.failedJoinWindowMs ?? 5 * 60_000);
     this.failedJoinBlockMs = Number(options.failedJoinBlockMs ?? 5 * 60_000);
 
+    this.maxFailedReclaims = Number(options.maxFailedReclaims ?? 5);
+    this.failedReclaimWindowMs = Number(options.failedReclaimWindowMs ?? 5 * 60_000);
+    this.failedReclaimBlockMs = Number(options.failedReclaimBlockMs ?? 5 * 60_000);
+
+    this.maxAdminAuthFails = Number(options.maxAdminAuthFails ?? 5);
+    this.adminAuthWindowMs = Number(options.adminAuthWindowMs ?? 10 * 60_000);
+    this.adminAuthBlockMs = Number(options.adminAuthBlockMs ?? 15 * 60_000);
+
     this.maxWsPerIp = Number(options.maxWsPerIp ?? 8);
     this.maxWsMessages = Number(options.maxWsMessages ?? 45);
     this.wsMessageWindowMs = Number(options.wsMessageWindowMs ?? 10_000);
@@ -57,6 +138,14 @@ export class RateLimiter {
     this.failedJoinsByIp = new Map();
     /** @type {Map<string, number>} */
     this.joinBlockedUntil = new Map();
+    /** @type {Map<string, number[]>} */
+    this.failedReclaimsByIp = new Map();
+    /** @type {Map<string, number>} */
+    this.reclaimBlockedUntil = new Map();
+    /** @type {Map<string, number[]>} */
+    this.failedAdminAuthsByIp = new Map();
+    /** @type {Map<string, number>} */
+    this.adminAuthBlockedUntil = new Map();
 
     this.sweepTimer = setInterval(() => this.sweep(), 5 * 60_000);
     this.sweepTimer.unref?.();
@@ -203,12 +292,71 @@ export class RateLimiter {
     }
   }
 
+  checkReclaimAllowed(ip, now = Date.now()) {
+    const blockedUntil = this.reclaimBlockedUntil.get(ip);
+    if (blockedUntil && blockedUntil > now) {
+      const remaining = blockedUntil - now;
+      return {
+        allowed: false,
+        code: "RATE_LIMITED",
+        message: `Too many invalid room reclaim attempts. Try again in ${formatRemaining(remaining)}.`,
+      };
+    }
+    if (blockedUntil && blockedUntil <= now) {
+      this.reclaimBlockedUntil.delete(ip);
+    }
+    return { allowed: true };
+  }
+
+  recordFailedReclaim(ip, now = Date.now()) {
+    const fails = this.pruneWindow(this.failedReclaimsByIp, ip, this.failedReclaimWindowMs, now);
+    fails.push(now);
+    if (fails.length >= this.maxFailedReclaims) {
+      this.reclaimBlockedUntil.set(ip, now + this.failedReclaimBlockMs);
+      this.failedReclaimsByIp.delete(ip);
+    } else {
+      this.failedReclaimsByIp.set(ip, fails);
+    }
+  }
+
+  checkAdminAuthAllowed(ip, now = Date.now()) {
+    const blockedUntil = this.adminAuthBlockedUntil.get(ip);
+    if (blockedUntil && blockedUntil > now) {
+      const remaining = blockedUntil - now;
+      return {
+        allowed: false,
+        retryAfterSec: Math.max(1, Math.ceil(remaining / 1000)),
+      };
+    }
+    if (blockedUntil && blockedUntil <= now) {
+      this.adminAuthBlockedUntil.delete(ip);
+    }
+    return { allowed: true };
+  }
+
+  recordFailedAdminAuth(ip, now = Date.now()) {
+    const fails = this.pruneWindow(this.failedAdminAuthsByIp, ip, this.adminAuthWindowMs, now);
+    fails.push(now);
+    if (fails.length >= this.maxAdminAuthFails) {
+      this.adminAuthBlockedUntil.set(ip, now + this.adminAuthBlockMs);
+      this.failedAdminAuthsByIp.delete(ip);
+    } else {
+      this.failedAdminAuthsByIp.set(ip, fails);
+    }
+  }
+
   sweep(now = Date.now()) {
     for (const [ip, until] of this.roomCreateBlockedUntil) {
       if (until <= now) this.roomCreateBlockedUntil.delete(ip);
     }
     for (const [ip, until] of this.joinBlockedUntil) {
       if (until <= now) this.joinBlockedUntil.delete(ip);
+    }
+    for (const [ip, until] of this.reclaimBlockedUntil) {
+      if (until <= now) this.reclaimBlockedUntil.delete(ip);
+    }
+    for (const [ip, until] of this.adminAuthBlockedUntil) {
+      if (until <= now) this.adminAuthBlockedUntil.delete(ip);
     }
     for (const ip of this.httpHitsByIp.keys()) {
       this.pruneWindow(this.httpHitsByIp, ip, this.httpWindowMs, now);
@@ -218,6 +366,12 @@ export class RateLimiter {
     }
     for (const ip of this.failedJoinsByIp.keys()) {
       this.pruneWindow(this.failedJoinsByIp, ip, this.failedJoinWindowMs, now);
+    }
+    for (const ip of this.failedReclaimsByIp.keys()) {
+      this.pruneWindow(this.failedReclaimsByIp, ip, this.failedReclaimWindowMs, now);
+    }
+    for (const ip of this.failedAdminAuthsByIp.keys()) {
+      this.pruneWindow(this.failedAdminAuthsByIp, ip, this.adminAuthWindowMs, now);
     }
   }
 

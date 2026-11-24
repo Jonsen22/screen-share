@@ -79,6 +79,10 @@ const discordWebhookInput = el<HTMLInputElement>("discord-webhook-input");
 const discordModalError = el<HTMLElement>("discord-modal-error");
 const btnDiscordCancel = el<HTMLButtonElement>("btn-discord-cancel");
 const btnDiscordSave = el<HTMLButtonElement>("btn-discord-save");
+const banModal = el<HTMLElement>("ban-modal");
+const banModalNickname = el<HTMLElement>("ban-modal-nickname");
+const btnBanCancel = el<HTMLButtonElement>("btn-ban-cancel");
+const btnBanConfirm = el<HTMLButtonElement>("btn-ban-confirm");
 const btnHostMonitor = el<HTMLButtonElement>("btn-host-monitor");
 const btnHostMute = el<HTMLButtonElement>("btn-host-mute");
 const hostPreview = el<HTMLVideoElement>("host-preview");
@@ -441,7 +445,39 @@ function attachHostPreview(previewStream: MediaStream): void {
   hostVideoMeta.textContent = hostManager.getVideoMeta();
 }
 
+let pendingBanViewer: ConnectedViewer | null = null;
+
+function openBanModal(viewer: ConnectedViewer): void {
+  pendingBanViewer = viewer;
+  banModalNickname.textContent = viewer.nickname;
+  banModal.classList.remove("hidden");
+  window.requestAnimationFrame(() => btnBanCancel.focus());
+}
+
+function closeBanModal(): void {
+  pendingBanViewer = null;
+  banModal.classList.add("hidden");
+}
+
+btnBanCancel.addEventListener("click", () => closeBanModal());
+banModal.addEventListener("click", (e) => {
+  if (e.target === banModal) {
+    closeBanModal();
+  }
+});
+btnBanConfirm.addEventListener("click", () => {
+  const target = pendingBanViewer;
+  closeBanModal();
+  if (target) {
+    hostManager.banViewer(target.id);
+  }
+});
+
 function renderViewersList(viewers: ConnectedViewer[], maxViewers: number): void {
+  if (pendingBanViewer && !viewers.some((v) => v.id === pendingBanViewer?.id)) {
+    closeBanModal();
+  }
+
   const count = viewers.length;
   hostViewerPill.textContent = `${count} / ${maxViewers} Viewers`;
   hostViewersCount.textContent = `${count} / ${maxViewers}`;
@@ -468,6 +504,9 @@ function renderViewersList(viewers: ConnectedViewer[], maxViewers: number): void
     nameSpan.textContent = viewer.nickname;
     nameSpan.title = viewer.nickname;
 
+    const actionsDiv = document.createElement("div");
+    actionsDiv.className = "viewer-actions";
+
     const kickBtn = document.createElement("button");
     kickBtn.type = "button";
     kickBtn.className = "btn btn-kick";
@@ -477,8 +516,20 @@ function renderViewersList(viewers: ConnectedViewer[], maxViewers: number): void
       hostManager.kickViewer(viewer.id);
     });
 
+    const banBtn = document.createElement("button");
+    banBtn.type = "button";
+    banBtn.className = "btn btn-ban";
+    banBtn.textContent = "Ban";
+    banBtn.title = `Ban ${viewer.nickname} from this room session`;
+    banBtn.addEventListener("click", () => {
+      openBanModal(viewer);
+    });
+
+    actionsDiv.appendChild(kickBtn);
+    actionsDiv.appendChild(banBtn);
+
     li.appendChild(nameSpan);
-    li.appendChild(kickBtn);
+    li.appendChild(actionsDiv);
     hostViewersList.appendChild(li);
   }
 }
@@ -528,6 +579,7 @@ const hostManager = new HostManager({
   onEnded(reason) {
     isHosting = false;
     currentRoomCode = "";
+    closeBanModal();
     stopMeterLoop();
     setTabsLocked(false);
 
@@ -908,6 +960,12 @@ btnFullscreen.addEventListener("click", () => void toggleFullscreen());
 viewerVideo.addEventListener("dblclick", () => void toggleFullscreen());
 
 window.addEventListener("keydown", (e) => {
+  if (!banModal.classList.contains("hidden")) {
+    if (e.key === "Escape") {
+      closeBanModal();
+    }
+    return;
+  }
   if (!discordModal.classList.contains("hidden")) {
     if (e.key === "Escape") {
       closeDiscordModal();

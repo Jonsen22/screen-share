@@ -36,6 +36,7 @@ export class ViewerManager {
   private signalingUrl = "";
   private roomCode = "";
   private viewerId = "";
+  private viewerToken = "";
   private viewerNickname = "Viewer";
   private prevBytes = 0;
   private prevTimestamp = 0;
@@ -56,36 +57,41 @@ export class ViewerManager {
     await this.signaling.connect(signalingUrl);
 
     try {
-      const joined = await new Promise<{ code: string; viewerId: string; hostNickname: string }>(
-        (resolve, reject) => {
-          const timer = window.setTimeout(() => {
+      const joined = await new Promise<{
+        code: string;
+        viewerId: string;
+        viewerToken: string;
+        hostNickname: string;
+      }>((resolve, reject) => {
+        const timer = window.setTimeout(() => {
+          unsub();
+          reject(new Error("Timed out joining room."));
+        }, 8000);
+
+        const unsub = this.signaling.onMessage((msg) => {
+          if (msg.type === "joined_room") {
+            window.clearTimeout(timer);
             unsub();
-            reject(new Error("Timed out joining room."));
-          }, 8000);
+            resolve({
+              code: msg.code,
+              viewerId: msg.viewerId,
+              viewerToken: msg.viewerToken || "",
+              hostNickname: msg.hostNickname || "Host",
+            });
+          } else if (msg.type === "error") {
+            window.clearTimeout(timer);
+            unsub();
+            reject(new Error(msg.message));
+          }
+        });
 
-          const unsub = this.signaling.onMessage((msg) => {
-            if (msg.type === "joined_room") {
-              window.clearTimeout(timer);
-              unsub();
-              resolve({
-                code: msg.code,
-                viewerId: msg.viewerId,
-                hostNickname: msg.hostNickname || "Host",
-              });
-            } else if (msg.type === "error") {
-              window.clearTimeout(timer);
-              unsub();
-              reject(new Error(msg.message));
-            }
-          });
-
-          this.signaling.send({ type: "join_room", code: roomCode, nickname });
-        }
-      );
+        this.signaling.send({ type: "join_room", code: roomCode, nickname });
+      });
 
       this.active = true;
       this.roomCode = joined.code;
       this.viewerId = joined.viewerId;
+      this.viewerToken = joined.viewerToken;
       this.remoteStream = new MediaStream();
       this.pendingIce = [];
       this.remoteSet = false;
@@ -133,6 +139,7 @@ export class ViewerManager {
           type: "reattach_viewer",
           code: this.roomCode,
           viewerId: this.viewerId,
+          viewerToken: this.viewerToken,
           nickname: this.viewerNickname,
         });
         this.reconnecting = false;
@@ -214,6 +221,9 @@ export class ViewerManager {
         break;
       case "kicked":
         this.leave(msg.reason || "You were removed from the room by the host.", false);
+        break;
+      case "banned":
+        this.leave(msg.reason || "You were banned from this room by the host.", false);
         break;
       case "room_closed":
         this.leave(msg.reason || "Host ended the stream.", false);
@@ -373,5 +383,6 @@ export class ViewerManager {
     this.remoteSet = false;
     this.roomCode = "";
     this.viewerId = "";
+    this.viewerToken = "";
   }
 }

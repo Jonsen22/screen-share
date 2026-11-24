@@ -508,6 +508,18 @@ export class HostManager {
     this.emitViewersChange();
   }
 
+  banViewer(viewerId: string): void {
+    if (!this.active) return;
+    if (!this.peers.has(viewerId)) return;
+    try {
+      this.signaling.send({ type: "ban_viewer", targetId: viewerId });
+    } catch {
+      // Ignore if socket already closed
+    }
+    this.removePeer(viewerId);
+    this.emitViewersChange();
+  }
+
   private emitViewersChange(): void {
     const viewers: ConnectedViewer[] = Array.from(this.peers.values()).map((peer) => ({
       id: peer.id,
@@ -528,7 +540,7 @@ export class HostManager {
         break;
 
       case "viewer_left":
-        if (msg.explicit || msg.kicked) {
+        if (msg.explicit || msg.kicked || msg.banned) {
           this.removePeer(msg.viewerId);
           this.emitViewersChange();
         }
