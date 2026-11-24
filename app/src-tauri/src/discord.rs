@@ -104,7 +104,7 @@ pub fn send_webhook(
     let body_bytes = body.as_bytes();
 
     unsafe {
-        let agent = to_wide("screen-share/1.2.0");
+        let agent = to_wide("screen-share/2.0.0");
         let session = WinHttpOpen(
             PCWSTR(agent.as_ptr()),
             WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
