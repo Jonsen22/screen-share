@@ -1,6 +1,6 @@
 {
   "name": "screen-share-signaling",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "private": true,
   "type": "module",
   "description": "Lightweight WebSocket signaling server for screen-share (1 host to up to 5 viewers)",
