@@ -64,14 +64,32 @@
       </header>
 
       <div id="update-banner" class="update-banner hidden" role="status">
-        <div class="update-banner-text">
-          <span class="update-pill">UPDATE</span>
-          <span id="update-banner-msg">A new version is available.</span>
+        <div class="update-banner-main">
+          <div class="update-banner-text">
+            <span class="update-pill">UPDATE</span>
+            <span id="update-banner-msg">A new version is available.</span>
+          </div>
+          <div id="update-progress-wrap" class="update-progress-wrap hidden">
+            <div class="update-progress-track">
+              <div
+                id="update-progress-bar"
+                class="update-progress-bar"
+                role="progressbar"
+                aria-valuemin="0"
+                aria-valuemax="100"
+                aria-valuenow="0"
+              ></div>
+            </div>
+            <span id="update-progress-text" class="update-progress-text">Starting download...</span>
+          </div>
         </div>
         <div class="update-banner-actions">
+          <button id="btn-update-now" class="btn btn-primary btn-sm hidden" type="button">
+            Update Now
+          </button>
           <a
             id="update-download-link"
-            class="btn btn-primary btn-sm"
+            class="btn btn-primary btn-sm hidden"
             href="#"
             target="_blank"
             rel="noopener noreferrer"

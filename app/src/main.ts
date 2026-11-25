@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { relaunch } from "@tauri-apps/plugin-process";
 import {
   AudioAppInfo,
   AudioCaptureTarget,
@@ -7,7 +8,14 @@ import {
   isTauriRuntime,
   listAudioApps,
 } from "./audio/app-audio";
-import { checkForAppUpdate, getCurrentAppVersion } from "./version-check";
+import {
+  checkForAppUpdate,
+  checkForNativeUpdate,
+  DEFAULT_RELEASES_URL,
+  formatByteSize,
+  getCurrentAppVersion,
+  NativeUpdate,
+} from "./version-check";
 import { ConnectedViewer, ContentHintMode, HostManager, QualityPresetId } from "./webrtc/host";
 import { ActiveStreamInfo, normalizeSignalingUrl } from "./webrtc/signaling";
 import { ViewerManager } from "./webrtc/viewer";
@@ -50,6 +58,10 @@ const introAppVersion = el<HTMLElement>("intro-app-version");
 const btnIntroClose = el<HTMLButtonElement>("btn-intro-close");
 const updateBanner = el<HTMLElement>("update-banner");
 const updateBannerMsg = el<HTMLElement>("update-banner-msg");
+const updateProgressWrap = el<HTMLElement>("update-progress-wrap");
+const updateProgressBar = el<HTMLElement>("update-progress-bar");
+const updateProgressText = el<HTMLElement>("update-progress-text");
+const btnUpdateNow = el<HTMLButtonElement>("btn-update-now");
 const updateDownloadLink = el<HTMLAnchorElement>("update-download-link");
 const btnDismissUpdate = el<HTMLButtonElement>("btn-dismiss-update");
 
@@ -162,6 +174,12 @@ let currentNickname = "";
 let nicknameModalRequired = false;
 let pendingOnboardingAfterNickname = false;
 let latestAvailableVersion = "";
+let pendingNativeUpdate: NativeUpdate | null = null;
+let fallbackDownloadUrl = "";
+let defaultUpdateMessage = "";
+let isUpdating = false;
+let updateConfirmTimer: number | null = null;
+let awaitingActiveSessionConfirm = false;
 
 function openIntroModal(): void {
   introModal.classList.remove("hidden");
@@ -181,16 +199,200 @@ introModal.addEventListener("click", (e) => {
   }
 });
 
+function clearActiveSessionConfirm(restoreMessage: boolean): void {
+  if (updateConfirmTimer !== null) {
+    window.clearTimeout(updateConfirmTimer);
+    updateConfirmTimer = null;
+  }
+  awaitingActiveSessionConfirm = false;
+  btnUpdateNow.classList.remove("btn-danger");
+  btnUpdateNow.classList.add("btn-primary");
+  if (!isUpdating) {
+    btnUpdateNow.textContent = updateBanner.classList.contains("is-error")
+      ? "Retry Update"
+      : "Update Now";
+  }
+  if (restoreMessage && defaultUpdateMessage && !isUpdating) {
+    updateBannerMsg.textContent = defaultUpdateMessage;
+  }
+}
+
 btnDismissUpdate.addEventListener("click", () => {
+  if (isUpdating) return;
+  clearActiveSessionConfirm(false);
+  const toClose = pendingNativeUpdate;
+  pendingNativeUpdate = null;
+  if (toClose) {
+    void toClose.close().catch(() => {});
+  }
   updateBanner.classList.add("hidden");
+  updateBanner.classList.remove("is-error");
   if (latestAvailableVersion) {
     window.localStorage.setItem(DISMISSED_UPDATE_KEY, latestAvailableVersion);
+  }
+});
+
+updateDownloadLink.addEventListener("click", async (e) => {
+  if (!fallbackDownloadUrl) {
+    e.preventDefault();
+    return;
+  }
+  if (!isTauriRuntime()) {
+    return;
+  }
+  e.preventDefault();
+  try {
+    await invoke("open_external_url", { url: fallbackDownloadUrl });
+  } catch (err) {
+    updateBanner.classList.add("is-error");
+    updateBannerMsg.textContent = `Could not open download link: ${
+      err instanceof Error ? err.message : String(err)
+    }`;
+  }
+});
+
+btnUpdateNow.addEventListener("click", async () => {
+  if (isUpdating || !pendingNativeUpdate) return;
+
+  if ((isHosting || isWatching) && !awaitingActiveSessionConfirm) {
+    awaitingActiveSessionConfirm = true;
+    updateBannerMsg.textContent =
+      "You are in a live session — updating will disconnect you and restart the app. Click again to confirm.";
+    btnUpdateNow.textContent = "Stop & Update";
+    btnUpdateNow.classList.remove("btn-primary");
+    btnUpdateNow.classList.add("btn-danger");
+    updateConfirmTimer = window.setTimeout(() => {
+      clearActiveSessionConfirm(true);
+    }, 8000);
+    return;
+  }
+
+  clearActiveSessionConfirm(true);
+  updateBannerMsg.textContent = defaultUpdateMessage || "Downloading update...";
+  isUpdating = true;
+  btnUpdateNow.disabled = true;
+  btnDismissUpdate.disabled = true;
+  updateDownloadLink.classList.add("hidden");
+  updateBanner.classList.remove("is-error");
+
+  try {
+    if (isHosting) {
+      await hostManager.stop();
+    }
+    if (isWatching) {
+      viewerManager.leave();
+    }
+
+    updateProgressWrap.classList.remove("hidden");
+    updateProgressBar.classList.remove("indeterminate");
+    updateProgressBar.style.width = "0%";
+    updateProgressBar.setAttribute("aria-valuenow", "0");
+    btnUpdateNow.textContent = "Updating...";
+    updateProgressText.textContent = "Starting download...";
+
+    let totalBytes: number | null = null;
+    let downloadedBytes = 0;
+
+    await pendingNativeUpdate.downloadAndInstall((event) => {
+      switch (event.event) {
+        case "Started": {
+          totalBytes =
+            typeof event.data.contentLength === "number" && event.data.contentLength > 0
+              ? event.data.contentLength
+              : null;
+          downloadedBytes = 0;
+          updateProgressBar.classList.toggle("indeterminate", totalBytes === null);
+          updateProgressBar.style.width = totalBytes === null ? "" : "0%";
+          updateProgressBar.setAttribute("aria-valuenow", "0");
+          updateProgressText.textContent = totalBytes
+            ? `0% (0 B / ${formatByteSize(totalBytes)})`
+            : "Downloading...";
+          break;
+        }
+        case "Progress": {
+          downloadedBytes += event.data.chunkLength;
+          if (totalBytes) {
+            const pct = Math.min(100, Math.round((downloadedBytes / totalBytes) * 100));
+            updateProgressBar.style.width = `${pct}%`;
+            updateProgressBar.setAttribute("aria-valuenow", String(pct));
+            updateProgressText.textContent = `${pct}% (${formatByteSize(downloadedBytes)} / ${formatByteSize(totalBytes)})`;
+          } else {
+            updateProgressText.textContent = `Downloading... (${formatByteSize(downloadedBytes)})`;
+          }
+          break;
+        }
+        case "Finished": {
+          updateProgressBar.classList.remove("indeterminate");
+          updateProgressBar.style.width = "100%";
+          updateProgressBar.setAttribute("aria-valuenow", "100");
+          updateProgressText.textContent = "100%";
+          updateBannerMsg.textContent = "Update downloaded! Restarting...";
+          break;
+        }
+      }
+    });
+
+    await relaunch();
+  } catch (err) {
+    isUpdating = false;
+    updateProgressWrap.classList.add("hidden");
+    updateProgressBar.classList.remove("indeterminate");
+    updateBanner.classList.add("is-error");
+    updateBannerMsg.textContent = `Update failed: ${
+      err instanceof Error ? err.message : String(err)
+    }`;
+    btnUpdateNow.disabled = false;
+    btnUpdateNow.textContent = "Retry Update";
+    btnDismissUpdate.disabled = false;
+    if (fallbackDownloadUrl) {
+      updateDownloadLink.href = fallbackDownloadUrl;
+      updateDownloadLink.classList.remove("btn-primary", "hidden");
+      updateDownloadLink.classList.add("btn-secondary");
+    }
   }
 });
 
 async function runStartupVersionCheck(): Promise<void> {
   const currentVersion = await getCurrentAppVersion();
   introAppVersion.textContent = `v${currentVersion}`;
+
+  if (isTauriRuntime()) {
+    const nativeUpdate = await checkForNativeUpdate();
+    if (nativeUpdate) {
+      const dismissed = window.localStorage.getItem(DISMISSED_UPDATE_KEY);
+      if (dismissed === nativeUpdate.version) {
+        void nativeUpdate.close().catch(() => {});
+        return;
+      }
+
+      if (pendingNativeUpdate && pendingNativeUpdate !== nativeUpdate) {
+        void pendingNativeUpdate.close().catch(() => {});
+      }
+      pendingNativeUpdate = nativeUpdate;
+      latestAvailableVersion = nativeUpdate.version;
+      fallbackDownloadUrl = DEFAULT_RELEASES_URL;
+
+      const firstLine = (nativeUpdate.body ?? "")
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .find((line) => line.length > 0);
+      const notes = firstLine ? ` — ${firstLine.slice(0, 120)}` : "";
+      defaultUpdateMessage = `Version v${nativeUpdate.version} is available (you're on v${currentVersion})${notes}`;
+      updateBannerMsg.textContent = defaultUpdateMessage;
+
+      updateBanner.classList.remove("is-error");
+      btnUpdateNow.textContent = "Update Now";
+      btnUpdateNow.disabled = false;
+      btnUpdateNow.classList.remove("btn-danger", "hidden");
+      btnUpdateNow.classList.add("btn-primary");
+
+      updateDownloadLink.href = fallbackDownloadUrl;
+      updateDownloadLink.classList.add("hidden");
+      updateProgressWrap.classList.add("hidden");
+      updateBanner.classList.remove("hidden");
+      return;
+    }
+  }
 
   const update = await checkForAppUpdate(getSignalingUrl());
   if (!update) return;
@@ -199,12 +401,19 @@ async function runStartupVersionCheck(): Promise<void> {
   if (dismissed === update.latestVersion) return;
 
   latestAvailableVersion = update.latestVersion;
+  fallbackDownloadUrl = update.downloadUrl || "";
   const notes = update.releaseNotes ? ` — ${update.releaseNotes}` : "";
-  updateBannerMsg.textContent = `Version v${update.latestVersion} is available (you're on v${update.currentVersion})${notes}`;
+  defaultUpdateMessage = `Version v${update.latestVersion} is available (you're on v${update.currentVersion})${notes}`;
+  updateBannerMsg.textContent = defaultUpdateMessage;
 
-  if (update.downloadUrl) {
-    updateDownloadLink.href = update.downloadUrl;
-    updateDownloadLink.classList.remove("hidden");
+  updateBanner.classList.remove("is-error");
+  btnUpdateNow.classList.add("hidden");
+  updateProgressWrap.classList.add("hidden");
+
+  if (fallbackDownloadUrl) {
+    updateDownloadLink.href = fallbackDownloadUrl;
+    updateDownloadLink.classList.remove("btn-secondary", "hidden");
+    updateDownloadLink.classList.add("btn-primary");
   } else {
     updateDownloadLink.classList.add("hidden");
   }

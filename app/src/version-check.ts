@@ -1,6 +1,12 @@
 import { getVersion } from "@tauri-apps/api/app";
+import { check, type Update } from "@tauri-apps/plugin-updater";
 import { isTauriRuntime } from "./audio/app-audio";
 import { normalizeSignalingUrl } from "./webrtc/signaling";
+
+export const DEFAULT_RELEASES_URL =
+  "https://github.com/Jonsen22/screen-share/releases/latest";
+
+export type NativeUpdate = Update;
 
 export interface UpdateInfo {
   currentVersion: string;
@@ -13,6 +19,33 @@ interface VersionEndpointResponse {
   latestVersion?: unknown;
   downloadUrl?: unknown;
   releaseNotes?: unknown;
+}
+
+export function formatByteSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+export async function checkForNativeUpdate(): Promise<NativeUpdate | null> {
+  if (!isTauriRuntime()) return null;
+
+  try {
+    const update = await check();
+    if (!update) return null;
+
+    const currentVersion = await getCurrentAppVersion();
+    if (update.version && !isNewerVersion(update.version, currentVersion)) {
+      void update.close().catch(() => {});
+      return null;
+    }
+
+    return update;
+  } catch {
+    // Non-fatal: ignore 404 (latest.json not yet published), offline, or dev-mode errors
+    return null;
+  }
 }
 
 export async function getCurrentAppVersion(): Promise<string> {
