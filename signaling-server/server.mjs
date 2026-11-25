@@ -22,7 +22,7 @@ const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 const MAX_NICKNAME_LEN = 24;
 const MAX_WS_PAYLOAD_BYTES = 64 * 1024; // 64 KB
-const LATEST_APP_VERSION = (process.env.LATEST_APP_VERSION || "2.0.1").trim();
+const LATEST_APP_VERSION = (process.env.LATEST_APP_VERSION || "2.1.0").trim();
 const APP_DOWNLOAD_URL = (
   process.env.APP_DOWNLOAD_URL || "https://github.com/Jonsen22/screen-share/releases/latest"
 ).trim();
