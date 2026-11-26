@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { relaunch } from "@tauri-apps/plugin-process";
+import changelogRaw from "../../CHANGELOG.md?raw";
 import {
   AudioAppInfo,
   AudioCaptureTarget,
@@ -14,6 +15,15 @@ import {
   MINI_PLAYER_CORNER_LABELS,
   MiniPlayerCorner,
 } from "./mini-player-geometry";
+import {
+  buildReleaseTagUrl,
+  compareSemver,
+  extractChangelogSection,
+  extractFirstSummaryLine,
+  normalizeVersion,
+  renderReleaseNotes,
+  stripReleaseBoilerplate,
+} from "./release-notes";
 import {
   checkForAppUpdate,
   checkForNativeUpdate,
@@ -32,6 +42,7 @@ const SIGNALING_STORAGE_KEY = import.meta.env.DEV
 const NICKNAME_STORAGE_KEY = "screen-share.nickname";
 const ONBOARDING_STORAGE_KEY = "screen-share.onboarding-seen";
 const DISMISSED_UPDATE_KEY = "screen-share.dismissed-update";
+const LAST_SEEN_VERSION_KEY = "screen-share.last-seen-version";
 const DISCORD_WEBHOOK_STORAGE_KEY = "screen-share.discord-webhook";
 const DEFAULT_SIGNALING_URL =
   normalizeSignalingUrl(import.meta.env.VITE_SIGNALING_URL ?? "") ||
@@ -58,15 +69,25 @@ const nicknameForm = el<HTMLFormElement>("nickname-form");
 const nicknameInput = el<HTMLInputElement>("nickname-input");
 const nicknameError = el<HTMLElement>("nickname-error");
 const btnNicknameCancel = el<HTMLButtonElement>("btn-nickname-cancel");
+const btnAppVersion = el<HTMLButtonElement>("btn-app-version");
 const btnOpenIntro = el<HTMLButtonElement>("btn-open-intro");
 const introModal = el<HTMLElement>("intro-modal");
-const introAppVersion = el<HTMLElement>("intro-app-version");
+const introAppVersion = el<HTMLButtonElement>("intro-app-version");
 const btnIntroClose = el<HTMLButtonElement>("btn-intro-close");
+const whatsNewModal = el<HTMLElement>("whats-new-modal");
+const whatsNewTitle = el<HTMLElement>("whats-new-title");
+const whatsNewSubtitle = el<HTMLElement>("whats-new-subtitle");
+const whatsNewVersion = el<HTMLElement>("whats-new-version");
+const whatsNewBody = el<HTMLElement>("whats-new-body");
+const whatsNewError = el<HTMLElement>("whats-new-error");
+const whatsNewGithubLink = el<HTMLAnchorElement>("whats-new-github-link");
+const btnWhatsNewClose = el<HTMLButtonElement>("btn-whats-new-close");
 const updateBanner = el<HTMLElement>("update-banner");
 const updateBannerMsg = el<HTMLElement>("update-banner-msg");
 const updateProgressWrap = el<HTMLElement>("update-progress-wrap");
 const updateProgressBar = el<HTMLElement>("update-progress-bar");
 const updateProgressText = el<HTMLElement>("update-progress-text");
+const btnWhatsNew = el<HTMLButtonElement>("btn-whats-new");
 const btnUpdateNow = el<HTMLButtonElement>("btn-update-now");
 const updateDownloadLink = el<HTMLAnchorElement>("update-download-link");
 const btnDismissUpdate = el<HTMLButtonElement>("btn-dismiss-update");
@@ -186,7 +207,11 @@ let currentRoomCode = "";
 let currentNickname = "";
 let nicknameModalRequired = false;
 let pendingOnboardingAfterNickname = false;
+let currentAppVersion = normalizeVersion(__APP_VERSION__);
 let latestAvailableVersion = "";
+let latestReleaseNotesRaw = "";
+let whatsNewGithubUrl = DEFAULT_RELEASES_URL;
+let pendingPostUpdateWhatsNewVersion: string | null = null;
 let pendingNativeUpdate: NativeUpdate | null = null;
 let fallbackDownloadUrl = "";
 let defaultUpdateMessage = "";
@@ -194,6 +219,17 @@ let isUpdating = false;
 let updateConfirmTimer: number | null = null;
 let awaitingActiveSessionConfirm = false;
 let lastNonZeroViewerVolume = 1;
+
+function setDisplayedAppVersion(version: string): void {
+  const normalized = normalizeVersion(version);
+  if (!normalized) return;
+  currentAppVersion = normalized;
+  const label = `v${normalized}`;
+  btnAppVersion.textContent = label;
+  introAppVersion.textContent = label;
+}
+
+setDisplayedAppVersion(currentAppVersion);
 
 function updateMiniPlayerUi(active: boolean, corner: MiniPlayerCorner): void {
   btnMiniPlayer.classList.toggle("btn-active", active);
@@ -225,6 +261,7 @@ function openIntroModal(): void {
 function closeIntroModal(): void {
   introModal.classList.add("hidden");
   window.localStorage.setItem(ONBOARDING_STORAGE_KEY, "1");
+  flushPendingPostUpdateWhatsNew();
 }
 
 btnOpenIntro.addEventListener("click", () => openIntroModal());
@@ -232,6 +269,137 @@ btnIntroClose.addEventListener("click", () => closeIntroModal());
 introModal.addEventListener("click", (e) => {
   if (e.target === introModal) {
     closeIntroModal();
+  }
+});
+
+function openWhatsNewModal(options: {
+  version: string;
+  subtitle: string;
+  markdown: string;
+  title?: string;
+}): void {
+  void miniPlayer.exit();
+  if (!introModal.classList.contains("hidden")) {
+    introModal.classList.add("hidden");
+    window.localStorage.setItem(ONBOARDING_STORAGE_KEY, "1");
+  }
+
+  const normalized = normalizeVersion(options.version);
+  whatsNewTitle.textContent = options.title ?? "What's New";
+  whatsNewSubtitle.textContent = options.subtitle;
+  whatsNewVersion.textContent = normalized ? `v${normalized}` : "Latest";
+  renderReleaseNotes(whatsNewBody, options.markdown);
+
+  whatsNewGithubUrl = buildReleaseTagUrl(options.version);
+  whatsNewGithubLink.href = whatsNewGithubUrl;
+  showAlert(whatsNewError, null);
+
+  whatsNewModal.classList.remove("hidden");
+  window.requestAnimationFrame(() => btnWhatsNewClose.focus());
+}
+
+function closeWhatsNewModal(): void {
+  whatsNewModal.classList.add("hidden");
+  showAlert(whatsNewError, null);
+}
+
+function openCurrentVersionWhatsNew(postUpdate = false): void {
+  pendingPostUpdateWhatsNewVersion = null;
+  if (currentAppVersion) {
+    window.localStorage.setItem(LAST_SEEN_VERSION_KEY, currentAppVersion);
+  }
+  const markdown = extractChangelogSection(changelogRaw, currentAppVersion) ?? "";
+  openWhatsNewModal({
+    title: postUpdate ? `Updated to v${currentAppVersion}` : "What's New",
+    version: currentAppVersion,
+    subtitle: postUpdate
+      ? `screen-share was updated to v${currentAppVersion}. Here's what changed:`
+      : `Release highlights for screen-share v${currentAppVersion}.`,
+    markdown,
+  });
+}
+
+function openAvailableUpdateWhatsNew(): void {
+  const targetVersion = normalizeVersion(latestAvailableVersion) || currentAppVersion;
+  const fromUpdate = stripReleaseBoilerplate(latestReleaseNotesRaw);
+  const markdown =
+    fromUpdate ||
+    extractChangelogSection(changelogRaw, targetVersion) ||
+    `Version v${targetVersion} is available. Open the GitHub release page below to view the full changelog.`;
+  openWhatsNewModal({
+    title: `What's New in v${targetVersion}`,
+    version: targetVersion,
+    subtitle: `Available update — you're currently on v${currentAppVersion}.`,
+    markdown,
+  });
+}
+
+function flushPendingPostUpdateWhatsNew(): void {
+  if (!pendingPostUpdateWhatsNewVersion) return;
+  if (!nicknameModal.classList.contains("hidden") || !introModal.classList.contains("hidden")) {
+    return;
+  }
+  if (isHosting || isWatching) return;
+
+  const versionToShow = pendingPostUpdateWhatsNewVersion;
+  pendingPostUpdateWhatsNewVersion = null;
+  window.localStorage.setItem(LAST_SEEN_VERSION_KEY, versionToShow);
+  openCurrentVersionWhatsNew(true);
+}
+
+function maybeShowPostUpdateWhatsNew(currentVersion: string): void {
+  const normalized = normalizeVersion(currentVersion);
+  if (!normalized) return;
+
+  const lastSeen = window.localStorage.getItem(LAST_SEEN_VERSION_KEY);
+  if (lastSeen === null) {
+    // First install: record silently so we don't stack a popup over onboarding
+    window.localStorage.setItem(LAST_SEEN_VERSION_KEY, normalized);
+    return;
+  }
+
+  const cmp = compareSemver(normalized, lastSeen);
+  if (cmp === null) {
+    window.localStorage.setItem(LAST_SEEN_VERSION_KEY, normalized);
+    return;
+  }
+
+  if (cmp > 0) {
+    if (isHosting || isWatching) return;
+    if (!nicknameModal.classList.contains("hidden") || !introModal.classList.contains("hidden")) {
+      pendingPostUpdateWhatsNewVersion = normalized;
+      return;
+    }
+    window.localStorage.setItem(LAST_SEEN_VERSION_KEY, normalized);
+    openCurrentVersionWhatsNew(true);
+  } else if (cmp < 0) {
+    // Downgrade / dev build: update silently
+    window.localStorage.setItem(LAST_SEEN_VERSION_KEY, normalized);
+  }
+}
+
+btnAppVersion.addEventListener("click", () => openCurrentVersionWhatsNew(false));
+introAppVersion.addEventListener("click", () => openCurrentVersionWhatsNew(false));
+btnWhatsNew.addEventListener("click", () => openAvailableUpdateWhatsNew());
+btnWhatsNewClose.addEventListener("click", () => closeWhatsNewModal());
+whatsNewModal.addEventListener("click", (e) => {
+  if (e.target === whatsNewModal) {
+    closeWhatsNewModal();
+  }
+});
+whatsNewGithubLink.addEventListener("click", async (e) => {
+  if (!isTauriRuntime()) {
+    return;
+  }
+  e.preventDefault();
+  showAlert(whatsNewError, null);
+  try {
+    await invoke("open_external_url", { url: whatsNewGithubUrl });
+  } catch (err) {
+    showAlert(
+      whatsNewError,
+      `Could not open GitHub release: ${err instanceof Error ? err.message : String(err)}`
+    );
   }
 });
 
@@ -391,7 +559,8 @@ btnUpdateNow.addEventListener("click", async () => {
 
 async function runStartupVersionCheck(): Promise<void> {
   const currentVersion = await getCurrentAppVersion();
-  introAppVersion.textContent = `v${currentVersion}`;
+  setDisplayedAppVersion(currentVersion);
+  maybeShowPostUpdateWhatsNew(currentVersion);
 
   if (isTauriRuntime()) {
     const nativeUpdate = await checkForNativeUpdate();
@@ -407,13 +576,11 @@ async function runStartupVersionCheck(): Promise<void> {
       }
       pendingNativeUpdate = nativeUpdate;
       latestAvailableVersion = nativeUpdate.version;
+      latestReleaseNotesRaw = nativeUpdate.body ?? "";
       fallbackDownloadUrl = DEFAULT_RELEASES_URL;
 
-      const firstLine = (nativeUpdate.body ?? "")
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .find((line) => line.length > 0);
-      const notes = firstLine ? ` — ${firstLine.slice(0, 120)}` : "";
+      const summary = extractFirstSummaryLine(stripReleaseBoilerplate(latestReleaseNotesRaw));
+      const notes = summary ? ` — ${summary.slice(0, 120)}` : "";
       defaultUpdateMessage = `Version v${nativeUpdate.version} is available (you're on v${currentVersion})${notes}`;
       updateBannerMsg.textContent = defaultUpdateMessage;
 
@@ -438,8 +605,10 @@ async function runStartupVersionCheck(): Promise<void> {
   if (dismissed === update.latestVersion) return;
 
   latestAvailableVersion = update.latestVersion;
+  latestReleaseNotesRaw = update.releaseNotes || "";
   fallbackDownloadUrl = update.downloadUrl || "";
-  const notes = update.releaseNotes ? ` — ${update.releaseNotes}` : "";
+  const summary = extractFirstSummaryLine(stripReleaseBoilerplate(latestReleaseNotesRaw));
+  const notes = summary ? ` — ${summary.slice(0, 120)}` : "";
   defaultUpdateMessage = `Version v${update.latestVersion} is available (you're on v${update.currentVersion})${notes}`;
   updateBannerMsg.textContent = defaultUpdateMessage;
 
@@ -531,10 +700,13 @@ nicknameForm.addEventListener("submit", (e) => {
     const codeToJoin = pendingDeepLinkCode;
     pendingDeepLinkCode = null;
     pendingOnboardingAfterNickname = false;
+    pendingPostUpdateWhatsNewVersion = null;
     void triggerDeepLinkJoin(codeToJoin);
   } else if (pendingOnboardingAfterNickname) {
     pendingOnboardingAfterNickname = false;
     openIntroModal();
+  } else {
+    flushPendingPostUpdateWhatsNew();
   }
 });
 
@@ -1647,6 +1819,12 @@ window.addEventListener("keydown", (e) => {
     }
     return;
   }
+  if (!whatsNewModal.classList.contains("hidden")) {
+    if (e.key === "Escape") {
+      closeWhatsNewModal();
+    }
+    return;
+  }
   if (!introModal.classList.contains("hidden")) {
     if (e.key === "Escape") {
       closeIntroModal();
@@ -1708,7 +1886,9 @@ void runStartupVersionCheck();
 
 async function triggerDeepLinkJoin(code: string): Promise<void> {
   if (isHosting || isWatching) return;
+  pendingPostUpdateWhatsNewVersion = null;
   closeIntroModal();
+  closeWhatsNewModal();
   setMode("viewer");
   roomCodeInput.value = code;
   if (!currentNickname) {

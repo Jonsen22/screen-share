@@ -1,6 +1,7 @@
 import { getVersion } from "@tauri-apps/api/app";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { isTauriRuntime } from "./audio/app-audio";
+import { compareSemver } from "./release-notes";
 import { normalizeSignalingUrl } from "./webrtc/signaling";
 
 export const DEFAULT_RELEASES_URL =
@@ -59,24 +60,9 @@ export async function getCurrentAppVersion(): Promise<string> {
   return __APP_VERSION__;
 }
 
-function parseSemver(version: string): [number, number, number] | null {
-  const cleaned = version.trim().replace(/^v/i, "").split("-")[0];
-  const parts = cleaned.split(".");
-  if (parts.length < 2 || parts.length > 3) return null;
-  const nums = parts.map((p) => Number(p));
-  if (nums.some((n) => !Number.isInteger(n) || n < 0)) return null;
-  return [nums[0] ?? 0, nums[1] ?? 0, nums[2] ?? 0];
-}
-
 export function isNewerVersion(latest: string, current: string): boolean {
-  const a = parseSemver(latest);
-  const b = parseSemver(current);
-  if (!a || !b) return false;
-  for (let i = 0; i < 3; i++) {
-    if (a[i] > b[i]) return true;
-    if (a[i] < b[i]) return false;
-  }
-  return false;
+  const cmp = compareSemver(latest, current);
+  return cmp !== null && cmp > 0;
 }
 
 function signalingToHttpBase(signalingUrl: string): string | null {

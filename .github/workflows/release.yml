@@ -36,6 +36,12 @@ jobs:
         working-directory: app
         run: npm ci
 
+      - name: Extract release notes from CHANGELOG.md
+        id: extract_notes
+        env:
+          RELEASE_REF_NAME: ${{ github.ref_name }}
+        run: node scripts/extract-release-notes.mjs "$env:RELEASE_REF_NAME" --include-installer-note --github-output release_notes
+
       - name: Build Windows installer and publish GitHub Release
         uses: tauri-apps/tauri-action@v0
         env:
@@ -46,10 +52,7 @@ jobs:
           projectPath: app
           tagName: v__VERSION__
           releaseName: "screen-share v__VERSION__"
-          releaseBody: |
-            Windows installer for **screen-share v__VERSION__**.
-
-            Download and run the `*-setup.exe` installer below.
+          releaseBody: ${{ steps.extract_notes.outputs.release_notes }}
           releaseDraft: false
           prerelease: false
           updaterJsonPreferNsis: true
