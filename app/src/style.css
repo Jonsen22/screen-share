@@ -1162,3 +1162,181 @@ body {
     grid-template-columns: 1fr;
   }
 }
+
+/* Always-on-Top Mini Player */
+.mini-player-overlay {
+  display: none;
+}
+
+body.mini-player .topbar,
+body.mini-player .update-banner,
+body.mini-player #viewer-streams-bar,
+body.mini-player #viewer-join,
+body.mini-player #view-host,
+body.mini-player #viewer-video-wrap > .viewer-controls,
+body.mini-player #stats-hud,
+body.mini-player .modal-backdrop {
+  display: none !important;
+}
+
+body.mini-player .main-content {
+  padding: 0;
+  overflow: hidden;
+}
+
+body.mini-player #viewer-stage {
+  gap: 0;
+}
+
+body.mini-player #viewer-video-wrap {
+  border-radius: 0;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  background: #000;
+  cursor: grab;
+}
+
+body.mini-player #viewer-video-wrap:active {
+  cursor: grabbing;
+}
+
+body.mini-player #viewer-video-wrap button,
+body.mini-player #viewer-video-wrap input {
+  cursor: pointer;
+}
+
+body.mini-player #viewer-banner {
+  font-size: 12px;
+  padding: 6px 10px;
+  text-align: center;
+}
+
+body.mini-player #btn-unmute-overlay {
+  top: 34px;
+  padding: 5px 12px;
+  font-size: 11px;
+}
+
+body.mini-player #mini-player-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.16s ease;
+}
+
+body.mini-player #viewer-video-wrap:hover #mini-player-overlay,
+body.mini-player #viewer-video-wrap:focus-within #mini-player-overlay {
+  opacity: 1;
+}
+
+.mini-player-top,
+.mini-player-bottom {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+}
+
+.mini-player-top {
+  justify-content: space-between;
+  background: linear-gradient(rgba(6, 7, 10, 0.84), transparent);
+}
+
+.mini-player-bottom {
+  justify-content: flex-start;
+  background: linear-gradient(transparent, rgba(6, 7, 10, 0.88));
+}
+
+.mini-player-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.mini-live-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--danger);
+  box-shadow: 0 0 6px rgba(218, 55, 60, 0.85);
+  flex-shrink: 0;
+}
+
+.mini-player-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+}
+
+.mini-player-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  pointer-events: auto;
+}
+
+.mini-player-bottom button,
+.mini-player-bottom input {
+  pointer-events: auto;
+}
+
+.mini-ctrl-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  height: 24px;
+  min-width: 24px;
+  padding: 0 7px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(15, 17, 22, 0.78);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  flex-shrink: 0;
+  backdrop-filter: blur(6px);
+  transition: background 0.14s ease, border-color 0.14s ease;
+}
+
+.mini-ctrl-btn:hover {
+  background: rgba(31, 36, 48, 0.92);
+  border-color: rgba(255, 255, 255, 0.32);
+}
+
+.mini-ctrl-btn-primary {
+  background: rgba(88, 101, 242, 0.88);
+  border-color: rgba(88, 101, 242, 0.95);
+  color: #fff;
+}
+
+.mini-ctrl-btn-primary:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.mini-ctrl-icon {
+  width: 13px;
+  height: 13px;
+  display: block;
+}
+
+.mini-volume-slider {
+  width: 72px;
+  min-width: 48px;
+  flex: 0 1 84px;
+}

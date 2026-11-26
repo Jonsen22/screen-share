@@ -432,12 +432,78 @@
                   <button id="btn-toggle-stats" class="btn btn-ghost btn-sm" type="button">
                     Stats (I)
                   </button>
+                  <button
+                    id="btn-mini-player"
+                    class="btn btn-ghost btn-sm"
+                    type="button"
+                    title="Pop out Always-on-Top Mini Player (P)"
+                  >
+                    Mini Player (P)
+                  </button>
                   <button id="btn-fullscreen" class="btn btn-ghost btn-sm" type="button">
                     Fullscreen (F)
                   </button>
                   <button id="btn-leave-room" class="btn btn-danger btn-sm" type="button">
                     Leave
                   </button>
+                </div>
+              </div>
+
+              <div id="mini-player-overlay" class="mini-player-overlay">
+                <div class="mini-player-top">
+                  <div class="mini-player-status">
+                    <span class="mini-live-dot" aria-hidden="true"></span>
+                    <span id="mini-player-label" class="mini-player-label">LIVE</span>
+                  </div>
+                  <div class="mini-player-actions">
+                    <button
+                      id="btn-mini-snap"
+                      class="mini-ctrl-btn"
+                      type="button"
+                      title="Snap to next corner"
+                      aria-label="Snap Mini Player to next corner"
+                    >
+                      <svg class="mini-ctrl-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <rect x="2" y="2" width="12" height="12" rx="2" />
+                        <rect x="8.5" y="8.5" width="3.5" height="3.5" rx="0.6" fill="currentColor" stroke="none" />
+                      </svg>
+                    </button>
+                    <button
+                      id="btn-mini-restore"
+                      class="mini-ctrl-btn mini-ctrl-btn-primary"
+                      type="button"
+                      title="Return to full window (Esc / P)"
+                      aria-label="Return to full window"
+                    >
+                      <svg class="mini-ctrl-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <polyline points="6 2.5 2.5 2.5 2.5 6" />
+                        <polyline points="10 13.5 13.5 13.5 13.5 10" />
+                        <line x1="2.5" y1="2.5" x2="6.5" y2="6.5" />
+                        <line x1="13.5" y1="13.5" x2="9.5" y2="9.5" />
+                      </svg>
+                    </button>
+                  </div>
+                </div>
+                <div id="mini-player-audio-bar" class="mini-player-bottom">
+                  <button
+                    id="btn-mini-mute"
+                    class="mini-ctrl-btn"
+                    type="button"
+                    title="Mute / Unmute"
+                    aria-label="Mute stream"
+                  >
+                    Mute
+                  </button>
+                  <input
+                    id="mini-volume"
+                    class="volume-slider mini-volume-slider"
+                    type="range"
+                    min="0"
+                    max="1"
+                    step="0.02"
+                    value="1"
+                    aria-label="Mini Player Volume"
+                  />
                 </div>
               </div>
             </div>
@@ -472,7 +538,7 @@
             <li class="intro-item">
               <div class="intro-item-title">Quick Tips &amp; Shortcuts</div>
               <p class="muted small">
-                Hosts can switch screens, quality, or audio source live without closing the room. While watching, press <kbd>I</kbd> for the telemetry HUD and <kbd>F</kbd> (or double-click) for fullscreen.
+                Hosts can switch screens, quality, or audio source live without closing the room. While watching, press <kbd>I</kbd> for the telemetry HUD, <kbd>P</kbd> for the always-on-top Mini Player, and <kbd>F</kbd> (or double-click) for fullscreen.
               </p>
             </li>
           </ul>

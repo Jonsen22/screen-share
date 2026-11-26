@@ -8,6 +8,12 @@ import {
   isTauriRuntime,
   listAudioApps,
 } from "./audio/app-audio";
+import { MiniPlayerController } from "./mini-player";
+import {
+  getNextCorner,
+  MINI_PLAYER_CORNER_LABELS,
+  MiniPlayerCorner,
+} from "./mini-player-geometry";
 import {
   checkForAppUpdate,
   checkForNativeUpdate,
@@ -140,9 +146,16 @@ const viewerRoomBadge = el<HTMLElement>("viewer-room-badge");
 const btnViewerMute = el<HTMLButtonElement>("btn-viewer-mute");
 const viewerVolume = el<HTMLInputElement>("viewer-volume");
 const btnToggleStats = el<HTMLButtonElement>("btn-toggle-stats");
+const btnMiniPlayer = el<HTMLButtonElement>("btn-mini-player");
 const btnFullscreen = el<HTMLButtonElement>("btn-fullscreen");
 const btnLeaveRoom = el<HTMLButtonElement>("btn-leave-room");
 const statsHud = el<HTMLElement>("stats-hud");
+const miniPlayerLabel = el<HTMLElement>("mini-player-label");
+const miniPlayerAudioBar = el<HTMLElement>("mini-player-audio-bar");
+const btnMiniSnap = el<HTMLButtonElement>("btn-mini-snap");
+const btnMiniRestore = el<HTMLButtonElement>("btn-mini-restore");
+const btnMiniMute = el<HTMLButtonElement>("btn-mini-mute");
+const miniVolume = el<HTMLInputElement>("mini-volume");
 
 // Co-stream modal elements
 const costreamModal = el<HTMLElement>("costream-modal");
@@ -180,8 +193,31 @@ let defaultUpdateMessage = "";
 let isUpdating = false;
 let updateConfirmTimer: number | null = null;
 let awaitingActiveSessionConfirm = false;
+let lastNonZeroViewerVolume = 1;
+
+function updateMiniPlayerUi(active: boolean, corner: MiniPlayerCorner): void {
+  btnMiniPlayer.classList.toggle("btn-active", active);
+  btnMiniPlayer.textContent = active ? "Exit Mini (P)" : "Mini Player (P)";
+  btnMiniPlayer.setAttribute("aria-pressed", String(active));
+  const nextCorner = getNextCorner(corner);
+  btnMiniSnap.title = `Snap corner (${MINI_PLAYER_CORNER_LABELS[corner]} → ${MINI_PLAYER_CORNER_LABELS[nextCorner]})`;
+}
+
+const miniPlayer = new MiniPlayerController({
+  videoEl: viewerVideo,
+  onStateChange: updateMiniPlayerUi,
+});
+miniPlayer.attachDragSurface(viewerVideoWrap);
+updateMiniPlayerUi(false, miniPlayer.getCorner());
+
+if (!miniPlayer.isSupported()) {
+  btnMiniPlayer.disabled = true;
+  btnMiniPlayer.title =
+    "Mini Player / Picture-in-Picture is not supported in this browser";
+}
 
 function openIntroModal(): void {
+  void miniPlayer.exit();
   introModal.classList.remove("hidden");
   window.requestAnimationFrame(() => btnIntroClose.focus());
 }
@@ -276,6 +312,7 @@ btnUpdateNow.addEventListener("click", async () => {
   updateBanner.classList.remove("is-error");
 
   try {
+    await miniPlayer.exit();
     if (isHosting) {
       await hostManager.stop();
     }
@@ -439,6 +476,7 @@ function setNickname(name: string): void {
 
 function openNicknameModal(required: boolean): void {
   if (!required && (isHosting || isWatching)) return;
+  void miniPlayer.exit();
   nicknameModalRequired = required;
   nicknameModalTitle.textContent = required ? "Choose a Nickname" : "Change Nickname";
   btnNicknameCancel.classList.toggle("hidden", required);
@@ -529,6 +567,7 @@ function showAlert(node: HTMLElement, message: string | null): void {
 
 function setMode(mode: "host" | "viewer"): void {
   if (isHosting || isWatching) return;
+  void miniPlayer.exit();
   activeMode = mode;
   tabHost.classList.toggle("active", mode === "host");
   tabHost.setAttribute("aria-selected", String(mode === "host"));
@@ -1166,6 +1205,7 @@ let viewerJoinedCode = "";
 
 function openCostreamModal(): void {
   if (!isWatching) return;
+  void miniPlayer.exit();
   showAlert(costreamError, null);
   btnCostreamStart.disabled = false;
   btnCostreamStart.textContent = "Pick Screen & Share";
@@ -1279,6 +1319,10 @@ function renderViewerStreamsBar(
     viewerLocalPreview.classList.remove("hidden");
     btnUnmuteOverlay.classList.add("hidden");
     viewerRoomBadge.textContent = `Room ${viewerJoinedCode} · Your Preview (Muted)`;
+    miniPlayerLabel.textContent = "Your Preview";
+    miniPlayerAudioBar.classList.add("hidden");
+    btnMiniMute.disabled = true;
+    miniVolume.disabled = true;
   } else {
     viewerLocalPreview.classList.add("hidden");
     viewerVideo.classList.remove("hidden");
@@ -1286,7 +1330,51 @@ function renderViewerStreamsBar(
     viewerRoomBadge.textContent = activeStream
       ? `Room ${viewerJoinedCode} · ${activeStream.nickname}`
       : `Room ${viewerJoinedCode}`;
+    miniPlayerLabel.textContent = activeStream
+      ? activeStream.nickname
+      : `Room ${viewerJoinedCode}`;
+    miniPlayerAudioBar.classList.remove("hidden");
+    btnMiniMute.disabled = false;
+    miniVolume.disabled = false;
   }
+}
+
+function syncViewerAudioUi(): void {
+  const volStr = String(viewerVideo.volume);
+  viewerVolume.value = volStr;
+  miniVolume.value = volStr;
+  const muted = viewerVideo.muted || viewerVideo.volume === 0;
+  const label = muted ? "Unmute" : "Mute";
+  btnViewerMute.textContent = label;
+  btnMiniMute.textContent = label;
+  btnMiniMute.setAttribute("aria-label", muted ? "Unmute stream" : "Mute stream");
+  if (!muted) {
+    btnUnmuteOverlay.classList.add("hidden");
+  }
+}
+
+function applyViewerVolume(rawVol: number): void {
+  const vol = Number.isFinite(rawVol) ? Math.min(1, Math.max(0, rawVol)) : 1;
+  if (vol > 0) {
+    lastNonZeroViewerVolume = vol;
+  }
+  viewerVideo.volume = vol;
+  viewerVideo.muted = vol === 0;
+  syncViewerAudioUi();
+}
+
+function toggleViewerMute(): void {
+  if (viewerVideo.muted || viewerVideo.volume === 0) {
+    const restored = lastNonZeroViewerVolume > 0 ? lastNonZeroViewerVolume : 1;
+    viewerVideo.volume = restored;
+    viewerVideo.muted = false;
+  } else {
+    if (viewerVideo.volume > 0) {
+      lastNonZeroViewerVolume = viewerVideo.volume;
+    }
+    viewerVideo.muted = true;
+  }
+  syncViewerAudioUi();
 }
 
 // Viewer Manager
@@ -1307,6 +1395,11 @@ const viewerManager = new ViewerManager({
     btnViewerShareMute.textContent = "Mute Shared Audio";
     btnViewerShareMute.classList.remove("btn-active");
     viewerRoomBadge.textContent = `Room ${code} · ${hostNickname}`;
+    miniPlayerLabel.textContent = hostNickname || `Room ${code}`;
+    miniPlayerAudioBar.classList.remove("hidden");
+    btnMiniMute.disabled = false;
+    miniVolume.disabled = false;
+    syncViewerAudioUi();
     viewerJoin.classList.add("hidden");
     viewerStage.classList.remove("hidden");
   },
@@ -1320,12 +1413,17 @@ const viewerManager = new ViewerManager({
     if (viewerVideo.srcObject !== stream) {
       viewerVideo.srcObject = stream;
     }
-    viewerVideo.muted = Number(viewerVolume.value) === 0;
-    viewerVideo.volume = Number(viewerVolume.value);
+    const targetVol = Number(viewerVolume.value);
+    if (targetVol > 0) {
+      lastNonZeroViewerVolume = targetVol;
+    }
+    viewerVideo.volume = targetVol;
+    viewerVideo.muted = targetVol === 0;
+    syncViewerAudioUi();
     void viewerVideo.play().catch(() => {
       // Browser blocked unmuted autoplay — start muted and prompt user with one-click unmute
       viewerVideo.muted = true;
-      btnViewerMute.textContent = "Unmute";
+      syncViewerAudioUi();
       btnUnmuteOverlay.classList.remove("hidden");
       void viewerVideo.play().catch(() => {});
     });
@@ -1379,6 +1477,7 @@ const viewerManager = new ViewerManager({
   onEnded(reason) {
     isWatching = false;
     viewerJoinedCode = "";
+    void miniPlayer.exit();
     closeCostreamModal();
     setTabsLocked(false);
 
@@ -1408,13 +1507,16 @@ const viewerManager = new ViewerManager({
 });
 
 btnUnmuteOverlay.addEventListener("click", () => {
+  const restored =
+    Number(viewerVolume.value) > 0
+      ? Number(viewerVolume.value)
+      : lastNonZeroViewerVolume > 0
+        ? lastNonZeroViewerVolume
+        : 1;
+  lastNonZeroViewerVolume = restored;
+  viewerVideo.volume = restored;
   viewerVideo.muted = false;
-  if (Number(viewerVolume.value) === 0) {
-    viewerVolume.value = "1";
-  }
-  viewerVideo.volume = Number(viewerVolume.value);
-  btnViewerMute.textContent = "Mute";
-  btnUnmuteOverlay.classList.add("hidden");
+  syncViewerAudioUi();
   void viewerVideo.play().catch(() => {});
 });
 
@@ -1452,25 +1554,24 @@ viewerJoinForm.addEventListener("submit", async (e) => {
 });
 
 btnLeaveRoom.addEventListener("click", () => {
+  void miniPlayer.exit();
   viewerManager.leave();
 });
 
 viewerVolume.addEventListener("input", () => {
-  const vol = Number(viewerVolume.value);
-  viewerVideo.volume = vol;
-  viewerVideo.muted = vol === 0;
-  btnViewerMute.textContent = viewerVideo.muted ? "Unmute" : "Mute";
-  if (!viewerVideo.muted) {
-    btnUnmuteOverlay.classList.add("hidden");
-  }
+  applyViewerVolume(Number(viewerVolume.value));
+});
+
+miniVolume.addEventListener("input", () => {
+  applyViewerVolume(Number(miniVolume.value));
 });
 
 btnViewerMute.addEventListener("click", () => {
-  viewerVideo.muted = !viewerVideo.muted;
-  btnViewerMute.textContent = viewerVideo.muted ? "Unmute" : "Mute";
-  if (!viewerVideo.muted) {
-    btnUnmuteOverlay.classList.add("hidden");
-  }
+  toggleViewerMute();
+});
+
+btnMiniMute.addEventListener("click", () => {
+  toggleViewerMute();
 });
 
 function toggleStats(): void {
@@ -1481,13 +1582,51 @@ async function toggleFullscreen(): Promise<void> {
   if (document.fullscreenElement) {
     await document.exitFullscreen().catch(() => {});
   } else {
+    await miniPlayer.exit();
     await viewerVideoWrap.requestFullscreen().catch(() => {});
   }
 }
 
+function handleViewerSurfaceDblClick(): void {
+  if (miniPlayer.isEngaged()) {
+    void miniPlayer.exit();
+  } else {
+    void toggleFullscreen();
+  }
+}
+
 btnToggleStats.addEventListener("click", toggleStats);
+btnMiniPlayer.addEventListener("click", () => {
+  if (!isWatching || activeMode !== "viewer") return;
+  void miniPlayer.toggle();
+});
+btnMiniSnap.addEventListener("click", () => {
+  void miniPlayer.snapNextCorner();
+});
+btnMiniRestore.addEventListener("click", () => {
+  void miniPlayer.exit();
+});
 btnFullscreen.addEventListener("click", () => void toggleFullscreen());
-viewerVideo.addEventListener("dblclick", () => void toggleFullscreen());
+viewerVideo.addEventListener("dblclick", handleViewerSurfaceDblClick);
+viewerLocalPreview.addEventListener("dblclick", handleViewerSurfaceDblClick);
+
+window.addEventListener("beforeunload", () => {
+  miniPlayer.cleanupOnUnload();
+});
+
+function isTypingElement(target: EventTarget | null, allowRange: boolean): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target.isContentEditable) return true;
+  const tag = target.tagName;
+  if (tag === "TEXTAREA" || tag === "SELECT") return true;
+  if (tag === "INPUT") {
+    if (allowRange && (target as HTMLInputElement).type === "range") {
+      return false;
+    }
+    return true;
+  }
+  return false;
+}
 
 window.addEventListener("keydown", (e) => {
   if (!costreamModal.classList.contains("hidden")) {
@@ -1521,10 +1660,33 @@ window.addEventListener("keydown", (e) => {
     return;
   }
   if (!isWatching || activeMode !== "viewer") return;
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+  if (miniPlayer.isEngaged()) {
+    if (e.key === "Escape" && !isTypingElement(e.target, true)) {
+      e.preventDefault();
+      void miniPlayer.exit();
+      return;
+    }
+    if (isTypingElement(e.target, false)) return;
+    if (e.key === "p" || e.key === "P") {
+      e.preventDefault();
+      void miniPlayer.toggle();
+    } else if (e.key === "f" || e.key === "F") {
+      e.preventDefault();
+      void toggleFullscreen();
+    }
+    return;
+  }
+
+  if (isTypingElement(e.target, false)) return;
   if (e.key === "i" || e.key === "I") {
     toggleStats();
   } else if (e.key === "f" || e.key === "F") {
     void toggleFullscreen();
+  } else if ((e.key === "p" || e.key === "P") && miniPlayer.isSupported()) {
+    e.preventDefault();
+    void miniPlayer.enter();
   }
 });
 
