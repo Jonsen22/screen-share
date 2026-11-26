@@ -2,6 +2,13 @@
 
 All notable changes to **screen-share** are documented in this file.
 
+## [v2.3.0] - 2026-11-25
+
+### Added
+- **What's New Popup & Update Banner Button:** Click **What's New** directly from the update banner (even while an update is downloading) or click the version badge in the top bar anytime to view release highlights inside the app.
+- **Post-Update Release Highlights:** Automatically shows a one-time **What's New** popup after upgrading to a new version (suppressed on first install and while in a live stream).
+- **Automated GitHub Release Notes:** GitHub Releases and the in-app updater manifest (`latest.json`) now pull release notes automatically from `CHANGELOG.md`.
+
 ## [v2.2.0] - 2026-11-25
 
 ### Added
